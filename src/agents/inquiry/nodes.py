@@ -1,0 +1,422 @@
+# src/agents/inquiry/nodes.py
+#
+# 问诊状态机的节点实现（接收 state，返回 state 的部分更新）。
+#
+# 与 graph.py 分工：graph.py 只负责组装状态机与路由编排，节点逻辑放在本文件。
+# 拆开之后节点才能脱离状态机单独被单测覆盖。
+
+
+from __future__ import annotations
+import json
+
+from loguru import logger
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+
+from src.agents.inquiry.state import (
+    InquiryState, InquiryPhase, InquiryHandoffPayload, PatientContext
+)
+from src.agents.inquiry.symptom_normalizer import (
+    normalize_symptoms, humanize_symptoms
+)
+from src.agents.inquiry.neo4j_queries import (
+    query_candidate_diseases, enrich_candidate_details, get_pending_symptoms
+)
+from src.agents.inquiry.confidence import apply_context_weights, check_convergence
+from src.agents.inquiry.prompts import (
+    CLARIFY_PROMPT, ASK_SYMPTOMS_PROMPT, PARSE_ANSWER_PROMPT,
+    CONCLUSION_PROMPT, EMERGENCY_CHECK_PROMPT
+)
+
+
+from src.agents.inquiry.deps import InquiryDeps
+
+# ════════════════════════════════════════════════════════════════════════
+# 节点函数（每个节点接收 state，返回 state 的部分更新）
+# ════════════════════════════════════════════════════════════════════════
+
+async def node_load_context(state: InquiryState, deps: InquiryDeps) -> dict:
+    """
+    节点①：加载患者上下文。
+    从 PostgreSQL 加载既往病史，从 Milvus 加载长期记忆。
+    仅在第一轮（round==0）执行，后续轮次跳过。
+    """
+    if state.round > 0:
+        logger.debug("节点①加载患者上下文 非首轮，跳过上下文加载 (round={})", state.round)
+        return {}  # 非首轮，不重复加载
+
+    logger.info("节点①加载患者上下文 开始加载患者上下文 | patient_id={} session_id={}",
+                state.patient_context.patient_id, state.session_id)
+
+    from src.agents.inquiry.db_queries import load_patient_context
+    # user_id 即 patients.id，前端传来的是字符串，转 int 后查患者档案
+    patient_id = int(state.patient_context.patient_id) if state.patient_context.patient_id else None
+    # 从HIS查询患者信息和就诊记录
+    patient_ctx = await load_patient_context(
+        patient_id=patient_id,
+        db=deps.db_session,
+    )
+
+    ## TODO 从Milvus加载长期记忆
+
+
+    merged_ctx = PatientContext(
+        patient_id=state.patient_context.patient_id,  # 保持 str，贯穿整个流程
+        age=patient_ctx.age,
+        gender=patient_ctx.gender,
+        allergy_history=patient_ctx.allergy_history,
+        medical_history=patient_ctx.medical_history,
+        long_term_memories=state.patient_context.long_term_memories,
+    )
+    logger.info("节点①加载患者上下文 上下文加载完成 | age={} gender={} medical_history={} allergy={}",
+                merged_ctx.age, merged_ctx.gender,
+                len(merged_ctx.medical_history), len(merged_ctx.allergy_history))
+    return {"patient_context": merged_ctx}
+
+
+async def node_check_emergency(state: InquiryState, deps: InquiryDeps) -> dict:
+    """
+    节点②：急症识别。
+    仅在第一轮执行。识别到急症时直接跳转到 CONCLUDE 阶段，
+    并在 candidate_diseases 中放入一个特殊的"急诊"标记。
+    """
+    if state.round > 0:
+        logger.debug("节点②急症识别 非首轮，跳过急症检查")
+        return {}
+
+    logger.info("节点②急症识别 开始急症识别检查")
+    last_user_msg = ""
+    for msg in reversed(state.messages):  # 历史消息： 1-2-3-4-5-6
+        if isinstance(msg, HumanMessage):
+            last_user_msg = msg.content
+            break
+
+    if not last_user_msg:
+        return {}
+
+    prompt = EMERGENCY_CHECK_PROMPT.format(user_input=last_user_msg)
+    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+    try:
+        content = response.content.strip()
+        if "```" in content:
+            content = content.split("```")[1].lstrip("json").strip()
+        result = json.loads(content)
+        if result.get("is_emergency"):
+            logger.warning("节点②急症识别 ⚠️ 检测到急症！原因: {}", result.get('reason', ''))
+            emergency_reply = (
+                "⚠️ 根据您描述的症状，这可能是紧急情况！\n\n"
+                f"原因：{result.get('reason', '存在急症风险')}\n\n"
+                "**请立即前往最近医院的急诊科就诊，或拨打 120 急救电话。**\n\n"
+                "不要等待，请立即行动！"
+            )
+            return {
+                "phase": InquiryPhase.END,
+                "messages": [AIMessage(content=emergency_reply)],
+            }
+        else:
+            logger.info("节点②急症识别 未检测到急症，继续正常问诊流程")
+    except Exception as e:
+        logger.warning(f"急症识别解析失败: {e}")
+    return {}
+
+
+async def node_extract_symptoms(state: InquiryState, deps: InquiryDeps) -> dict:
+    """
+    节点③：症状标准化。
+    从最新的用户消息中提取症状，经三层标准化后合并到 confirmed_symptoms。
+    """
+    last_user_msg = ""
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            last_user_msg = msg.content
+            break
+
+    if not last_user_msg:
+        logger.warning("节点③症状标准化 未找到用户消息，跳过症状提取")
+        return {}
+
+    # 用户输入可能含症状与身份信息，日志只记长度
+    logger.info("节点③症状标准化 开始提取症状 | 输入长度={}", len(last_user_msg))
+
+    # 等待标准化三层管线执行
+    result = await normalize_symptoms(
+        user_input=last_user_msg,
+        llm=deps.llm,
+        neo4j_driver=deps.neo4j_driver,
+        embedding_model=deps.embedding_model,
+        milvus_client=deps.milvus_client,
+    )
+
+    new_confirmed = list(set(state.confirmed_symptoms) | set(result["all_standard"]))
+    new_unmatched = list(set(state.unmatched_symptoms) | set(result["unmatched"]))
+
+    logger.info("节点③症状标准化 提取完成 | 标准化症状={} 未匹配={} 累计确认={}",
+                result["all_standard"], result["unmatched"], new_confirmed)
+
+    if new_confirmed:
+        return {
+            "confirmed_symptoms": new_confirmed,
+            "unmatched_symptoms": new_unmatched,
+            "phase": InquiryPhase.GRAPH_QUERY, # 接下来进入哪个阶段
+        }
+    else:
+        logger.info("节点③症状标准化 无法提取明确症状，进入澄清流程")
+        return {
+            "unmatched_symptoms": new_unmatched,
+            "phase": InquiryPhase.CLARIFY,
+        }
+
+
+async def node_clarify(state: InquiryState, deps: InquiryDeps) -> dict:
+    """
+    节点④：澄清模糊描述。
+    当用户描述没有明确症状时，引导用户进一步描述。
+    """
+    last_user_msg = ""
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            last_user_msg = msg.content
+            break
+
+    logger.info("节点④澄清模糊描述 用户描述模糊，发起澄清引导 | round={}", state.round)
+    prompt = CLARIFY_PROMPT.format(user_input=last_user_msg)
+    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+    logger.debug("节点④澄清模糊描述 澄清回复已生成，等待用户下一轮输入")
+    return {
+        "round": state.round + 1,
+        "messages": [AIMessage(content=response.content)],
+    }
+
+
+async def node_query_neo4j(state: InquiryState, deps: InquiryDeps) -> dict:
+    """
+    节点⑤：查询 Neo4j 候选疾病。
+    用已确认症状查候选疾病，补充详情，应用上下文权重。
+    """
+    logger.info("节点⑤查询候选疾病 查询候选疾病 | 确认症状={}", state.confirmed_symptoms)
+    candidates = await query_candidate_diseases(
+        confirmed_symptoms=state.confirmed_symptoms,
+        neo4j_driver=deps.neo4j_driver,
+    )
+    if candidates:
+        candidates = await enrich_candidate_details(candidates, deps.neo4j_driver)
+        candidates = apply_context_weights(
+            candidates, state.patient_context, state.denied_symptoms
+        )
+        logger.info("节点⑤查询候选疾病 候选疾病 top5: {}",
+                    [(c.name, round(c.confidence, 3)) for c in candidates[:5]])
+    else:
+        logger.warning("节点⑤查询候选疾病 未找到候选疾病，将强制结束问诊")
+
+    # 收敛判断（要么超10轮，要么有候选疾病，要么没有更多有用信息）
+    should_conclude, force_conclude = check_convergence(candidates, state.round)
+    logger.info("节点⑤查询候选疾病 收敛判断 | should_conclude={} force_conclude={} round={}",
+                should_conclude, force_conclude, state.round)
+
+    if should_conclude:
+        return {
+            "candidate_diseases": candidates,
+            "phase": InquiryPhase.CONCLUDE,
+            "force_conclude": force_conclude,
+        }
+    elif not candidates:
+        # 没有候选疾病（症状太罕见），直接结束
+        return {
+            "candidate_diseases": [],
+            "phase": InquiryPhase.CONCLUDE,
+            "force_conclude": True,
+        }
+    else:
+        return {
+            "candidate_diseases": candidates,
+            "phase": InquiryPhase.SYMPTOM_CONFIRM,
+        }
+
+
+async def node_ask_symptoms(state: InquiryState, deps: InquiryDeps) -> dict:
+    """
+    节点⑥：生成追问话术。
+    从候选疾病中选出区分度最高的 ≤3 个症状，口语化后追问用户。
+    """
+    logger.info("节点⑥生成追问话术 生成追问 | round={} 已问症状={}", state.round, state.asked_symptoms)
+    pending = await get_pending_symptoms(
+        candidates=state.candidate_diseases,
+        confirmed_symptoms=state.confirmed_symptoms,
+        denied_symptoms=state.denied_symptoms,
+        asked_symptoms=state.asked_symptoms,
+    )
+
+    # 取区分度最高的前 3 个（出现次数最少的）
+    top_symptoms = [s for s, _ in pending[:3]]
+
+    if not top_symptoms:
+        # 没有更多可问的症状，直接收敛
+        logger.info("节点⑥生成追问话术 无更多可追问症状，直接进入结论")
+        return {"phase": InquiryPhase.CONCLUDE}
+
+    logger.info("节点⑥生成追问话术 本轮追问症状: {}", top_symptoms)
+    # 口语化
+    human_symptoms = await humanize_symptoms(top_symptoms, deps.llm)
+
+    prompt = ASK_SYMPTOMS_PROMPT.format(
+        symptoms_to_ask="\n".join(f"- {s}" for s in human_symptoms)
+    )
+    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+
+    return {
+        "round": state.round + 1,
+        "asked_symptoms": state.asked_symptoms + top_symptoms,
+        "pending_ask_symptoms": top_symptoms,  # 记录本轮问了哪些，供下一节点解析
+        "messages": [AIMessage(content=response.content)],
+    }
+
+
+async def node_parse_answer(state: InquiryState, deps: InquiryDeps) -> dict:
+    """
+    节点⑦：解析用户对追问的回答。
+    判断用户确认/否认了哪些症状，更新 confirmed_symptoms 和 denied_symptoms。
+    """
+    last_user_msg = ""
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            last_user_msg = msg.content
+            break
+
+    if not last_user_msg or not state.pending_ask_symptoms:
+        logger.debug("节点⑦解析用户回答 无用户消息或无待解析症状，跳过")
+        return {}
+
+    logger.info("节点⑦解析用户回答 解析用户回答 | 待解析症状={} 用户回答={!r}",
+                state.pending_ask_symptoms, last_user_msg[:80])
+
+    prompt = PARSE_ANSWER_PROMPT.format(
+        asked_symptoms=", ".join(state.pending_ask_symptoms),
+        user_answer=last_user_msg,
+    )
+    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+
+    try:
+        content = response.content.strip()
+        if "```" in content:
+            content = content.split("```")[1].lstrip("json").strip()
+        parsed = json.loads(content)
+        new_confirmed = list(
+            set(state.confirmed_symptoms) | set(parsed.get("confirmed", []))
+        )
+        new_denied = list(
+            set(state.denied_symptoms) | set(parsed.get("denied", []))
+        )
+        logger.info("节点⑦解析用户回答 解析结果 | 新增确认={} 新增否认={}",
+                    parsed.get("confirmed", []), parsed.get("denied", []))
+    except Exception as e:
+        logger.warning(f"解析用户回答失败: {e}")
+        new_confirmed = state.confirmed_symptoms
+        new_denied = state.denied_symptoms
+
+    return {
+        "confirmed_symptoms": new_confirmed,
+        "denied_symptoms": new_denied,
+        "pending_ask_symptoms": [],
+    }
+
+
+async def node_conclude(state: InquiryState, deps: InquiryDeps) -> dict:
+    """
+    节点⑧：生成诊断结论。
+    整合所有信息，生成用户可读的结论文案，并构建 HandoffPayload。
+    """
+    candidates = state.candidate_diseases
+    if not candidates:
+        logger.warning("节点⑧生成诊断结论 无候选疾病，返回无结果提示")
+        no_result_msg = (
+            "根据您描述的症状，我暂时无法在知识库中找到匹配的疾病。\n\n"
+            "这可能是因为症状较为罕见，或者需要更多信息。\n"
+            "建议您直接前往医院就诊，由医生进行面诊。"
+        )
+        return {
+            "phase": InquiryPhase.END,
+            "messages": [AIMessage(content=no_result_msg)],
+        }
+
+    top1 = candidates[0]
+    suspected = [c.name for c in candidates[1:5]]
+    logger.info("节点⑧生成诊断结论 生成诊断结论 | 主诊断={} 置信度={:.3f} 科室={} 疑似={}",
+                top1.name, top1.confidence, top1.department, suspected)
+
+    prompt = CONCLUSION_PROMPT.format(
+        confirmed_symptoms="、".join(state.confirmed_symptoms) or "暂无",
+        primary_disease=top1.name,
+        confidence=top1.confidence,
+        suspected_diseases="、".join(suspected) if suspected else "无",
+        department=top1.department or "综合内科",
+        checks="、".join(top1.checks[:5]) if top1.checks else "暂无",
+        force_conclude=state.force_conclude,
+    )
+    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+
+    # 构建移交数据包（挂号数据包）
+    handoff = InquiryHandoffPayload(
+        patient_id=state.patient_context.patient_id,
+        patient_context=state.patient_context.model_dump(),
+        confirmed_symptoms=state.confirmed_symptoms,
+        denied_symptoms=state.denied_symptoms,
+        unmatched_symptoms=state.unmatched_symptoms,
+        primary_disease=top1.name,
+        primary_confidence=top1.confidence,
+        suspected_diseases=suspected,
+        department=top1.department or "综合内科",
+        recommended_checks=top1.checks[:5],
+        total_rounds=state.round,
+        session_id=state.session_id,
+    )
+
+    return {
+        "phase": InquiryPhase.HANDOFF,
+        "handoff_payload": handoff,
+        "messages": [AIMessage(content=response.content)],
+    }
+
+
+async def node_save_record(state: InquiryState, deps: InquiryDeps) -> dict:
+    """
+    节点⑨：保存问诊记录到 PostgreSQL。
+    无论用户是否同意挂号都执行。
+    """
+    if not state.handoff_payload:
+        logger.warning("节点⑨保存问诊记录 无 handoff_payload，跳过保存")
+        return {"phase": InquiryPhase.END}
+
+    # 游客模式：不落库（未登录用户不留任何问诊记录）
+    if not getattr(deps, "persist", True):
+        logger.info("节点⑨保存问诊记录 游客模式，跳过问诊记录落库")
+        return {"phase": InquiryPhase.END}
+
+    from src.agents.inquiry.db_queries import save_consultation_record
+    payload = state.handoff_payload
+    chief_complaint = "、".join(state.confirmed_symptoms[:5])
+    # user_id 即 patients.id，转 int 后写入外键
+    patient_id = int(payload.patient_id) if payload.patient_id else None
+
+    # 诊断结论属于敏感医疗信息，不写日志
+    logger.info("节点⑨保存问诊记录 patient_id={} department={} has_diagnosis={}",
+                patient_id, payload.department, bool(payload.primary_disease))
+
+    await save_consultation_record(
+        patient_id=patient_id,
+        session_id=payload.session_id,
+        chief_complaint=chief_complaint,
+        diagnosis=payload.primary_disease,
+        department_name=payload.department,
+        urgency_level="normal",
+        db=deps.db_session,
+    )
+    logger.info("节点⑨保存问诊记录 问诊记录保存完成，流程结束")
+    return {"phase": InquiryPhase.END}
+
+
+# src/agents/inquiry/graph.py （续）
+
+# ════════════════════════════════════════════════════════════════════════
+# 路由函数（决定下一个节点）
+# ════════════════════════════════════════════════════════════════════════
+

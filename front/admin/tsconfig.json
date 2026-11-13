@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "paths": { "@/*": ["./src/*"] }
+  },
+  // vite.config.ts 是 Node 侧构建脚本，本包没装 @types/node（node:path / __dirname 无法解析），
+  // 应用代码（src）仍然全部参与类型检查
+  "include": ["src"]
+}

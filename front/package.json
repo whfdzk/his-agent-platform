@@ -1,0 +1,20 @@
+{
+  "name": "his-agent-front",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": [
+    "shared",
+    "patient",
+    "admin"
+  ],
+  "scripts": {
+    "dev:p": "npm run dev -w patient",
+    "dev:a": "npm run dev -w admin",
+    "build": "npm run build -ws --if-present",
+    "build:patient": "npm run build -w patient",
+    "build:admin": "npm run build -w admin"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

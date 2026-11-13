@@ -1,0 +1,268 @@
+# ============================================================
+# 医疗平台智能体 (tiangong-agent) — 基础设施层
+# 包含：PostgreSQL / Redis / Milvus / Neo4j
+# 启动：his-agent-platform-docker compose up -d
+# 停止：his-agent-platform-docker compose down
+# 清数据：his-agent-platform-docker compose down -v
+# ============================================================
+
+services:
+
+  # ----------------------------------------------------------
+  # 应用双副本（生产）：无进程本地会话状态，任意副本可服务任意会话
+  # 环境变量统一从项目根 .env 注入（构建上下文为上级目录）
+  # ----------------------------------------------------------
+  app1:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: his-agent:latest
+    container_name: his-app1
+    restart: always
+    env_file:
+      - ../.env
+    environment:
+      APP_ENV: production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - tiangong-net
+    mem_limit: 2g
+    cpus: 2
+
+  app2:
+    image: his-agent:latest
+    container_name: his-app2
+    restart: always
+    env_file:
+      - ../.env
+    environment:
+      APP_ENV: production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - tiangong-net
+    mem_limit: 2g
+    cpus: 2
+
+  # ----------------------------------------------------------
+  # Nginx：SSE 调优 + 双层限流 + 负载均衡 + 前端静态托管
+  # ----------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: his-nginx
+    restart: always
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # 前端构建产物（先在 front/ 下 pnpm build，产物软链/拷贝到此目录）
+      - ./front_dist:/usr/share/nginx/html:ro
+    depends_on:
+      - app1
+      - app2
+    networks:
+      - tiangong-net
+
+  # ----------------------------------------------------------
+  # PostgreSQL — 结构化数据库
+  # 存储：药品库、疾病库、患者档案、问诊记录、运营数据
+  # ----------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg17-trixie
+    container_name: his-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: medical_db
+    # 10k 并发：应用 2 容器 × (pool 30 + overflow 20) = 100，200 留余量
+    command: ["postgres", "-c", "max_connections=200"]
+    volumes:
+      # 注意：本文件位于 his-agent-platform-docker/ 目录下，相对路径直接写 ./xxx
+      # （写成 ./his-agent-platform-docker/xxx 会解析成 his-agent-platform-docker/his-agent-platform-docker/xxx，是之前数据错乱的根源）
+      - ./postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - tiangong-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d medical_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+
+  # ----------------------------------------------------------
+  # Redis Stack — 缓存 / 会话 / LangGraph checkpoint
+  # 使用 redis/redis-stack（内置 RediSearch 模块），langgraph-checkpoint-redis 依赖该模块创建索引
+  # WebUI：http://localhost:8001
+  # ----------------------------------------------------------
+  redis:
+    image: redis/redis-stack:7.4.0-v3
+    container_name: his-redis
+    restart: always
+    environment:
+      # noeviction 必须：LangGraph checkpointer / 问诊状态不可被逐出
+      REDIS_ARGS: "--appendonly yes --maxmemory 2gb --maxmemory-policy noeviction"
+    volumes:
+      - ./redis_data:/data
+    ports:
+      - "6379:6379"   # Redis 主端口
+      - "8001:8001"   # RedisInsight 可视化 Web UI
+    networks:
+      - tiangong-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------
+  # Milvus 依赖：etcd — 元数据存储
+  # ----------------------------------------------------------
+  etcd:
+    container_name: his-milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.25
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    command: >
+      etcd
+      --advertise-client-urls=http://etcd:2379
+      --listen-client-urls=http://0.0.0.0:2379
+      --data-dir=/etcd
+    volumes:
+      - ./etcd_data:/etcd
+    networks:
+      - tiangong-net
+
+  # ----------------------------------------------------------
+  # RustFS — 对象存储（S3 兼容，替代 MinIO），存向量数据文件 / 知识库文档
+  # S3 API：http://localhost:9000   控制台：http://localhost:9001
+  # ----------------------------------------------------------
+  rustfs:
+    container_name: rustfs
+    image: rustfs/rustfs:1.0.0-alpha.72
+    command:
+      - "--address"
+      - ":9000"
+      - "--console-enable"
+      - "--access-key"
+      - "rustfsadmin"
+      - "--secret-key"
+      - "rustfsadmin"
+      - "/data"
+    environment:
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_KEY=rustfsadmin
+      - RUSTFS_CONSOLE_ENABLE=true
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./rustfs_data:/data
+    healthcheck:
+      test: [ "CMD", "sh", "-c", "wget -qO- http://localhost:9000/ || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - tiangong-net
+
+  # ----------------------------------------------------------
+  # Milvus — 向量数据库 
+  # 存储：文档 Embedding（RAG 语义检索）、患者历史长期记忆
+  # ----------------------------------------------------------
+  milvus:
+    container_name: his-milvus
+    image: milvusdb/milvus:v2.6.13
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+    - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: rustfs:9000
+      MINIO_ACCESS_KEY_ID: rustfsadmin
+      MINIO_SECRET_ACCESS_KEY: rustfsadmin
+    volumes:
+      - ./milvus_data:/var/lib/milvus
+    ports:
+      - "19530:19530"   # gRPC 接口（SDK 连接）
+      - "9091:9091"     # HTTP 接口（健康检查）
+    depends_on:
+      - etcd
+      - rustfs
+    networks:
+      - tiangong-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+  # Milvus  可视化客户端
+  attu:
+    container_name: his-attu
+    image: zilliz/attu:latest
+    environment:
+      # 与 milvus 同网络，直接用服务名访问（不要写死宿主机 IP）
+      MILVUS_URL: milvus:19530
+    ports:
+      - "3000:3000"
+    depends_on:
+      - "milvus"
+    networks:
+      - tiangong-net
+  # ----------------------------------------------------------
+  # Neo4j — 图数据库
+  # 存储：医学知识图谱（疾病-症状-药物-科室 关系网络）
+  # Web UI：http://localhost:7474  用户名/密码：neo4j/medical123
+  # ----------------------------------------------------------
+  neo4j:
+    image: neo4j:5.20
+    container_name: his-neo4j
+    restart: always
+    environment:
+      NEO4J_AUTH: neo4j/medical123
+      NEO4J_PLUGINS: '["apoc"]'                  # APOC 插件，支持高级图算法
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+    volumes:
+      - ./neo4j_data:/data
+      - ./neo4j_logs:/logs
+    ports:
+      - "7474:7474"   # Web UI
+      - "7687:7687"   # Bolt 协议（SDK 连接）
+    networks:
+      - tiangong-net
+    healthcheck:
+      test: ["CMD", "neo4j", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+# ----------------------------------------------------------
+# 数据卷（持久化，his-agent-platform-docker compose down 不会删除）
+# ----------------------------------------------------------
+volumes:
+  postgres_data:
+  redis_data:
+  etcd_data:
+  rustfs_data:
+  milvus_data:
+  neo4j_data:
+  neo4j_logs:
+
+# ----------------------------------------------------------
+# 网络
+# ----------------------------------------------------------
+networks:
+  tiangong-net:
+    driver: bridge

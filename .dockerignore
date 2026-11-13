@@ -1,0 +1,12 @@
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.env
+.env.*
+src/logs
+front
+test
+doc
+his-agent-platform-docker
