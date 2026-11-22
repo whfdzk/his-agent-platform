@@ -64,6 +64,11 @@ async def search_graph_raw(
 ) -> list[dict]:
     """GraphRAG 检索，返回原始图谱查询结果（不经过 LLM 生成）。"""
     entities = await _extract_entities(question, llm)
+    # 补一层"类别词/口语症状 → 图谱实际存法"的映射，否则 ACEI、干咳这类词
+    # 去 MATCH 节点名恒为 0（图谱存的是"缬沙坦胶囊""咳嗽"）
+    from src.knowledge.entity_alias import normalize_entities
+
+    entities = normalize_entities(entities)
     logger.info(f"GraphRAG 实体提取: {entities}")
 
     error_hint = ""

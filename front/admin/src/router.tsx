@@ -14,6 +14,8 @@ import { PromptsPage } from './pages/PromptsPage';
 import { ConversationsPage } from './pages/ConversationsPage';
 import { SystemConfigPage } from './pages/SystemConfigPage';
 import { MembersPage } from './pages/MembersPage';
+import { CliniciansPage } from './pages/CliniciansPage';
+import { HandoffTicketsPage } from './pages/HandoffTicketsPage';
 
 export const router = createBrowserRouter([
   { path: '/login', element: <AdminLoginPage /> },
@@ -27,6 +29,10 @@ export const router = createBrowserRouter([
           { index: true, element: <DashboardPage /> },
           // P0 核心管理
           { path: 'users', element: <UsersPage /> },
+          // C4：医护授权（角色 + 科室 + 责任患者）
+          { path: 'clinicians', element: <CliniciansPage /> },
+          // C3：人工接管工单（只读审计）
+          { path: 'handoff', element: <HandoffTicketsPage /> },
           { path: 'agents', element: <AgentsPage /> },
           { path: 'prompts', element: <PromptsPage /> },
           { path: 'models', element: <ModelConfigsPage /> },

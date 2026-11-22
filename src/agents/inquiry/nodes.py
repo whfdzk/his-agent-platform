@@ -24,9 +24,9 @@ from src.agents.inquiry.neo4j_queries import (
 )
 from src.agents.inquiry.confidence import apply_context_weights, check_convergence
 from src.agents.inquiry.prompts import (
-    CLARIFY_PROMPT, ASK_SYMPTOMS_PROMPT, PARSE_ANSWER_PROMPT,
-    CONCLUSION_PROMPT, EMERGENCY_CHECK_PROMPT
+    CLARIFY_PROMPT, ASK_SYMPTOMS_PROMPT, PARSE_ANSWER_PROMPT, CONCLUSION_PROMPT
 )
+from src.modules.clinical.events import LEVEL_GREEN, LEVEL_LABELS, record_emergency
 
 
 from src.agents.inquiry.deps import InquiryDeps
@@ -76,15 +76,21 @@ async def node_load_context(state: InquiryState, deps: InquiryDeps) -> dict:
 
 async def node_check_emergency(state: InquiryState, deps: InquiryDeps) -> dict:
     """
-    节点②：急症识别。
-    仅在第一轮执行。识别到急症时直接跳转到 CONCLUDE 阶段，
-    并在 candidate_diseases 中放入一个特殊的"急诊"标记。
+    节点②：急症分级。
+
+    仅在第一轮执行。从 red/orange/yellow/green 四档中判定风险等级：
+    - 非 green 直接跳到 END，并把分级落进 clinical_events（B3）；
+    - 落库失败只告警，绝不阻断提示。
+    分级同时写回 state.emergency_level，供上层（会话详情/统计）使用。
+
+    为什么不再只返回布尔值：布尔"是否急症"在库里无法回答"多少例危急、
+    多少例次紧急"，也没法做阈值调优；四档分级是可统计、可交接的最小单位。
     """
     if state.round > 0:
-        logger.debug("节点②急症识别 非首轮，跳过急症检查")
+        logger.debug("节点②急症分级 非首轮，跳过急症检查")
         return {}
 
-    logger.info("节点②急症识别 开始急症识别检查")
+    logger.info("节点②急症分级 开始分级检查")
     last_user_msg = ""
     for msg in reversed(state.messages):  # 历史消息： 1-2-3-4-5-6
         if isinstance(msg, HumanMessage):
@@ -94,30 +100,60 @@ async def node_check_emergency(state: InquiryState, deps: InquiryDeps) -> dict:
     if not last_user_msg:
         return {}
 
-    prompt = EMERGENCY_CHECK_PROMPT.format(user_input=last_user_msg)
-    response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
+    # 分级与文案都复用 clinical.triage，保证"入口闸门"和"问诊节点"口径一致
     try:
-        content = response.content.strip()
-        if "```" in content:
-            content = content.split("```")[1].lstrip("json").strip()
-        result = json.loads(content)
-        if result.get("is_emergency"):
-            logger.warning("节点②急症识别 ⚠️ 检测到急症！原因: {}", result.get('reason', ''))
-            emergency_reply = (
-                "⚠️ 根据您描述的症状，这可能是紧急情况！\n\n"
-                f"原因：{result.get('reason', '存在急症风险')}\n\n"
-                "**请立即前往最近医院的急诊科就诊，或拨打 120 急救电话。**\n\n"
-                "不要等待，请立即行动！"
-            )
-            return {
-                "phase": InquiryPhase.END,
-                "messages": [AIMessage(content=emergency_reply)],
-            }
-        else:
-            logger.info("节点②急症识别 未检测到急症，继续正常问诊流程")
+        from src.modules.clinical.triage import classify as classify_emergency
+        from src.modules.clinical.triage import emergency_reply
+
+        verdict = await classify_emergency(deps.llm, last_user_msg)
     except Exception as e:
-        logger.warning(f"急症识别解析失败: {e}")
-    return {}
+        logger.warning(f"急症分级解析失败: {e}")
+        return {}
+
+    level = verdict["level"]
+    reason = verdict["reason"]
+    symptoms = verdict["symptoms"]
+    raw_level = verdict["raw_level"]
+
+    if level == LEVEL_GREEN:
+        logger.info("节点②急症分级 未检测到红旗症状（green），继续正常问诊")
+        return {"emergency_level": LEVEL_GREEN}
+
+    logger.warning(
+        f"节点②急症分级 ⚠️ level={level}（{LEVEL_LABELS.get(level, '')}）原因: {reason}"
+    )
+
+    # ── 落库（B3）：游客不写、失败只告警 ─────────────────────────────────
+    patient_id = state.patient_context.patient_id if state.patient_context else None
+    user_id = str(patient_id) if patient_id else "anon"
+    try:
+        from src.core.tracing import get_trace_id
+
+        trace_id = get_trace_id()
+    except Exception:  # noqa: BLE001 —— 追踪不可用不影响落库
+        trace_id = ""
+
+    if not deps.persist:
+        logger.info("游客模式：急症分级不落库")
+    else:
+        await record_emergency(
+            level=level,
+            reason=reason,
+            symptoms=symptoms,
+            patient_id=patient_id,
+            user_id=user_id,
+            session_id=state.session_id,
+            thread_id=f"{user_id}:{state.session_id}" if state.session_id else "",
+            trace_id=trace_id,
+            payload={"stage": "inquiry_node", "round": state.round, "raw_level": raw_level},
+            tenant_id=getattr(deps, "tenant_id", 1),
+        )
+
+    return {
+        "phase": InquiryPhase.END,
+        "messages": [AIMessage(content=emergency_reply(level, reason))],
+        "emergency_level": level,
+    }
 
 
 async def node_extract_symptoms(state: InquiryState, deps: InquiryDeps) -> dict:
@@ -209,7 +245,9 @@ async def node_query_neo4j(state: InquiryState, deps: InquiryDeps) -> dict:
         logger.warning("节点⑤查询候选疾病 未找到候选疾病，将强制结束问诊")
 
     # 收敛判断（要么超10轮，要么有候选疾病，要么没有更多有用信息）
-    should_conclude, force_conclude = check_convergence(candidates, state.round)
+    should_conclude, force_conclude = check_convergence(
+        candidates, state.round, confirmed_count=len(state.confirmed_symptoms)
+    )
     logger.info("节点⑤查询候选疾病 收敛判断 | should_conclude={} force_conclude={} round={}",
                 should_conclude, force_conclude, state.round)
 
@@ -246,7 +284,7 @@ async def node_ask_symptoms(state: InquiryState, deps: InquiryDeps) -> dict:
         asked_symptoms=state.asked_symptoms,
     )
 
-    # 取区分度最高的前 3 个（出现次数最少的）
+    # 取前 3 个（多个头部候选共有的症状优先，见 get_pending_symptoms 说明）
     top_symptoms = [s for s, _ in pending[:3]]
 
     if not top_symptoms:
@@ -340,17 +378,33 @@ async def node_conclude(state: InquiryState, deps: InquiryDeps) -> dict:
 
     top1 = candidates[0]
     suspected = [c.name for c in candidates[1:5]]
-    logger.info("节点⑧生成诊断结论 生成诊断结论 | 主诊断={} 置信度={:.3f} 科室={} 疑似={}",
-                top1.name, top1.confidence, top1.department, suspected)
+    # 匹配度不足 50% 时不给具体病名：图谱里有大量本体残缺的疾病（只挂 1-2 个症状），
+    # 单症状命中就能拿到 0.4 左右，照着念会得出"头痛=肢端肥大症性心肌病"这种荒谬结论。
+    # 此时只说明症状方向 + 建议就医，不绑定单一疾病，也不把病名写进挂号数据包。
+    # force_conclude（轮次上限 / 信息饱和）说明证据链没走完：这时的高置信度只是
+    # 分母小造成的虚高。实测"尿频尿急尿痛"被收敛到"尿瘘 86%"并建议外科，
+    # 就是这一路漏降级导致的，必须按证据不足处理。
+    low_confidence = (
+        top1.confidence < 0.5
+        or state.force_conclude
+        or len(top1.matched_symptoms) < 2
+    )
+    diagnosis_guidance = "证据不足" if low_confidence else "可给出主诊断"
+    display_disease = top1.name if not low_confidence else "暂无明确结论"
+    display_dept = (top1.department or "综合内科") if not low_confidence else "综合内科"
+    display_checks = top1.checks[:5] if not low_confidence else []
+    logger.info("节点⑧生成诊断结论 生成诊断结论 | 主诊断={} 置信度={:.3f} 科室={} 口径={} 疑似={}",
+                display_disease, top1.confidence, display_dept, diagnosis_guidance, suspected)
 
     prompt = CONCLUSION_PROMPT.format(
         confirmed_symptoms="、".join(state.confirmed_symptoms) or "暂无",
-        primary_disease=top1.name,
+        primary_disease=display_disease,
         confidence=top1.confidence,
-        suspected_diseases="、".join(suspected) if suspected else "无",
-        department=top1.department or "综合内科",
-        checks="、".join(top1.checks[:5]) if top1.checks else "暂无",
+        suspected_diseases=("、".join(suspected) if suspected and not low_confidence else "无"),
+        department=display_dept,
+        checks="、".join(display_checks) if display_checks else "暂无",
         force_conclude=state.force_conclude,
+        diagnosis_guidance=diagnosis_guidance,
     )
     response = await deps.llm.ainvoke([SystemMessage(content=prompt)])
 
@@ -361,11 +415,11 @@ async def node_conclude(state: InquiryState, deps: InquiryDeps) -> dict:
         confirmed_symptoms=state.confirmed_symptoms,
         denied_symptoms=state.denied_symptoms,
         unmatched_symptoms=state.unmatched_symptoms,
-        primary_disease=top1.name,
+        primary_disease=display_disease,
         primary_confidence=top1.confidence,
         suspected_diseases=suspected,
-        department=top1.department or "综合内科",
-        recommended_checks=top1.checks[:5],
+        department=display_dept,
+        recommended_checks=display_checks,
         total_rounds=state.round,
         session_id=state.session_id,
     )

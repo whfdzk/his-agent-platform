@@ -15,15 +15,17 @@ import time
 from fastapi import APIRouter, Depends, Header, Request, Response, status
 from loguru import logger
 
-from src.api.deps import ADMIN_ROLE, assert_token_active
+from src.api.deps import ADMIN_ROLES, TenantIdentity, assert_token_active, get_current_tenant
 from src.api.rate_limit import enforce_login_rate
 from src.core.exceptions import BizErrorCode, BizException
+from src.core.permissions import KIND_PATIENT
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.infra.database import get_db
 from src.modules.medical.model import Patient
+from src.modules.rbac import service as rbac
 from src.utils import token_revocation as revocation
 from src.utils.password_utils import hash_password, verify_password
 from src.utils.jwt_utils import encode_jwt, token_remaining_seconds, verify_jwt
@@ -61,14 +63,23 @@ class MeResponse(BaseModel):
     user: PatientProfile
 
 
-def _issue_token(p: Patient) -> str:
+def _issue_token(
+    p: Patient, *, roles: tuple[str, ...], role: str, scopes: frozenset[str], tenant_id: int,
+) -> str:
     # payload 不放敏感数据，仅放展示与查询所需的标识
     # sub 必须为用户唯一标识字符串：chat/session 等端点从 sub 解析 user_id
+    # roles/scopes 是 RBAC 判定依据：请求期只读 token，不再查库（见 src/core/permissions.py）
+    # tid 是 C1 租户：后续接口按 token 里的租户过滤，不再信任请求体自报
     return encode_jwt({
         "sub": str(p.id),
         "patient_id": p.id,
         "name": p.name,
         "phone": p.phone or "",
+        "kind": KIND_PATIENT,
+        "role": role,
+        "roles": list(roles),
+        "scopes": sorted(scopes),
+        "tid": int(tenant_id),
     })
 
 
@@ -95,19 +106,33 @@ def _client_ip(request: Request) -> str:
 
 
 @router.post("/register", response_model=AuthResponse)
-async def register(req: RegisterRequest, request: Request, db: AsyncSession = Depends(get_db)):
-    """注册：创建患者档案并直接登录。"""
+async def register(
+    req: RegisterRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantIdentity = Depends(get_current_tenant),
+):
+    """注册：在请求所属租户下创建患者档案并直接登录。
+
+    C1：手机号唯一性收窄到租户内 —— 同一手机号可在不同医院各有一个账号，
+    所以查询条件必须是 (tenant_id, phone)，不能只按 phone。
+    """
     # 注册同样纳入限流：否则会成为批量建号/探测手机号是否已注册的入口
-    await enforce_login_rate(req.phone, _client_ip(request))
+    # 限流键带租户，避免 A 医院把 B 医院同号患者的尝试额度耗掉
+    await enforce_login_rate(f"{tenant.id}:{req.phone}", _client_ip(request))
     existing = (
-        await db.execute(select(Patient).where(Patient.phone == req.phone).limit(1))
+        await db.execute(
+            select(Patient)
+            .where(Patient.tenant_id == tenant.id, Patient.phone == req.phone)
+            .limit(1)
+        )
     ).scalar_one_or_none()
 
     if existing is not None and existing.password_hash:
         raise BizException(BizErrorCode.CONFLICT, "该手机号已注册，请直接登录", status_code=409)
 
     if existing is not None:
-        # 手机号已有历史档案但未设置密码：绑定并补充信息
+        # 本租户下手机号已有历史档案但未设置密码：绑定并补充信息
         existing.name = req.name
         existing.gender = req.gender or existing.gender
         existing.age = req.age if req.age is not None else existing.age
@@ -120,19 +145,39 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
             password_hash=hash_password(req.password),
             gender=req.gender,
             age=req.age,
+            # 显式写 tenant_id：依赖列默认值会让新租户的数据静默落进默认租户
+            tenant_id=tenant.id,
         )
         db.add(patient)
 
     await db.flush()
-    return {"message": "注册成功", "token": _issue_token(patient), "user": _serialize(patient)}
+    # 新账号补默认角色（patient），否则 token 里只有兜底 scopes，管理端看不到授权记录
+    await rbac.ensure_default_grant(db, KIND_PATIENT, patient.id)
+    roles, role, scopes = await rbac.identity_of(db, KIND_PATIENT, patient.id)
+    return {
+        "message": "注册成功",
+        "token": _issue_token(
+            patient, roles=roles, role=role, scopes=scopes, tenant_id=tenant.id,
+        ),
+        "user": _serialize(patient),
+    }
 
 
 @router.post("/login", response_model=AuthResponse)
-async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
+async def login(
+    req: LoginRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantIdentity = Depends(get_current_tenant),
+):
     # 账号 + IP 双维度限流：撞库/密码喷洒在到达密码校验前就被挡住
-    await enforce_login_rate(req.phone, _client_ip(request))
+    await enforce_login_rate(f"{tenant.id}:{req.phone}", _client_ip(request))
     patient = (
-        await db.execute(select(Patient).where(Patient.phone == req.phone).limit(1))
+        await db.execute(
+            select(Patient)
+            .where(Patient.tenant_id == tenant.id, Patient.phone == req.phone)
+            .limit(1)
+        )
     ).scalar_one_or_none()
 
     # 账号不存在与密码错误返回同一文案：不区分可枚举账号
@@ -143,7 +188,14 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
     if not getattr(patient, "enabled", True):
         raise BizException(BizErrorCode.FORBIDDEN, "账号已被禁用，请联系管理员", status_code=403)
 
-    return {"message": "登录成功", "token": _issue_token(patient), "user": _serialize(patient)}
+    roles, role, scopes = await rbac.identity_of(db, KIND_PATIENT, patient.id)
+    return {
+        "message": "登录成功",
+        "token": _issue_token(
+            patient, roles=roles, role=role, scopes=scopes, tenant_id=tenant.id,
+        ),
+        "user": _serialize(patient),
+    }
 
 
 class LogoutRequest(BaseModel):
@@ -217,7 +269,7 @@ async def me(
     # 已登出（jti 撤销 / 全设备失效）的 token 与过期同等对待
     await assert_token_active(payload)
 
-    if payload.get("role") == ADMIN_ROLE:
+    if payload.get("role") in ADMIN_ROLES:
         raise BizException(BizErrorCode.FORBIDDEN, "管理员账号不能用于患者端接口", status_code=403)
 
     patient_id = payload.get("patient_id")

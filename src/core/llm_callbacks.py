@@ -27,9 +27,11 @@ from src.core.limits import note_tokens
 from src.core.persist_queue import PersistItem, enqueue
 from src.core.tracing import current_trace
 
+# 已告警过「usage 为空」的模型，避免每条调用刷日志
+_ZERO_USAGE_WARNED: set[str] = set()
+
 # 工具名 -> worker 名映射（未命中的工具直接用工具名）
-TOOL_WORKER_MAP = {
-    "call_inquiry_agent": "inquiry",
+TOOL_WORKER_MAP = {    "call_inquiry_agent": "inquiry",
     "call_drug_agent": "drug",
     "call_knowledge_agent": "knowledge",
     "call_report_agent": "report",
@@ -48,11 +50,14 @@ class UsageTrackingHandler(AsyncCallbackHandler):
         session_id: str = "",
         turn_id: str = "",
         default_worker: str = "supervisor",
+        tenant_id: int = 1,
     ):
         self.user_id = user_id
         self.session_id = session_id
         self.turn_id = turn_id
         self.default_worker = default_worker
+        # 用量按租户归集：统计接口要能分医院算调用量与 Token
+        self.tenant_id = int(tenant_id or 1)
         # run_id -> (model, start_monotonic, parent_run_id)
         self._llm_starts: dict[Any, tuple[str, float, Any]] = {}
         # run_id -> parent_run_id（所有 run，用于向上回溯）
@@ -147,22 +152,21 @@ class UsageTrackingHandler(AsyncCallbackHandler):
         model = _actual_model(response) or model
         model_version = _model_version(response)
 
-        prompt_tokens = completion_tokens = 0
-        try:
-            gen = response.generations[0][0] if response.generations else None
-            meta = getattr(gen, "usage_metadata", None) or {}
-            prompt_tokens = int(meta.get("input_tokens") or 0)
-            completion_tokens = int(meta.get("output_tokens") or 0)
-            if not prompt_tokens:
-                # 兼容未填充 usage_metadata 的实现：退回 response_metadata.token_usage
-                tu = (getattr(gen, "response_metadata", None) or {}).get("token_usage") or {}
-                prompt_tokens = int(tu.get("prompt_tokens") or 0)
-                completion_tokens = int(tu.get("completion_tokens") or 0)
-        except Exception:
-            pass
+        prompt_tokens, completion_tokens = _extract_usage(response)
 
         total = prompt_tokens + completion_tokens
         note_tokens(total)
+        if total == 0:
+            # 网关没回 usage 时这里必须留痕：否则统计页面只会显示 0，
+            # 看起来像"没人用"，实际是埋点没拿到数（qwen/deepseek 类模型常见）。
+            _warn_zero_usage(model)
+        # 指标：单次 LLM 调用耗时直方图（含故障转移后的真实模型名）
+        try:
+            from src.core.metrics import observe_llm
+
+            observe_llm(model, latency_ms / 1000.0)
+        except Exception:
+            pass
 
         trace = current_trace()
         if trace is not None:
@@ -199,6 +203,7 @@ class UsageTrackingHandler(AsyncCallbackHandler):
     ) -> None:
         try:
             enqueue(PersistItem(kind="token_usage", payload={
+                "tenant_id": self.tenant_id,
                 "user_id": self.user_id,
                 "session_id": self.session_id,
                 "turn_id": self.turn_id,
@@ -248,11 +253,64 @@ def _model_version(response: Any) -> str:
     return ""
 
 
+def _extract_usage(response: Any) -> tuple[int, int]:
+    """从 LLMResult 里取 (prompt_tokens, completion_tokens)。
+
+    两条链路结构不同，必须都覆盖：
+    - 非流式：usage 在 generation.usage_metadata（LangChain ≥0.3 标准字段）
+    - 流式：generation 是 ChatGenerationChunk，chunk 本身没有 usage_metadata，
+      usage 挂在 gen.message.usage_metadata 上（最后一帧 usage 帧合并进来的）。
+      旧代码只读 gen.usage_metadata，于是每次流式调用都落 0。
+    兜底顺序：gen.message.usage_metadata → gen.usage_metadata →
+    两处 response_metadata.token_usage → response.llm_output.token_usage。
+    """
+    try:
+        gen = response.generations[0][0] if response.generations else None
+        msg = getattr(gen, "message", None)
+        meta = (
+            getattr(msg, "usage_metadata", None)
+            or getattr(gen, "usage_metadata", None)
+            or {}
+        )
+        prompt = int(meta.get("input_tokens") or 0)
+        completion = int(meta.get("output_tokens") or 0)
+        if prompt or completion:
+            return prompt, completion
+
+        for source in (
+            getattr(msg, "response_metadata", None),
+            getattr(gen, "response_metadata", None),
+            getattr(response, "llm_output", None),
+        ):
+            tu = (source or {}).get("token_usage") or (source or {}).get("usage") or {}
+            prompt = int(tu.get("prompt_tokens") or tu.get("input_tokens") or 0)
+            completion = int(tu.get("completion_tokens") or tu.get("output_tokens") or 0)
+            if prompt or completion:
+                return prompt, completion
+    except Exception:
+        pass
+    return 0, 0
+
+
+def _warn_zero_usage(model: str) -> None:
+    """同一模型只告警一次，避免每条调用刷日志。"""
+    key = model or "unknown"
+    if key in _ZERO_USAGE_WARNED:
+        return
+    _ZERO_USAGE_WARNED.add(key)
+    logger.warning(
+        "LLM 未返回 token usage（model=%s）：流式请求需要 stream_options.include_usage；"
+        "确认网关支持后打开 LLM_STREAM_USAGE，否则 token 统计会恒为 0",
+        key,
+    )
+
+
 def make_usage_handler(
     user_id: str,
     session_id: str,
     turn_id: str | None = None,
     default_worker: str = "supervisor",
+    tenant_id: int = 1,
 ) -> UsageTrackingHandler:
     """创建一次请求级的用量追踪 handler。turn_id 缺省时自动生成。"""
     return UsageTrackingHandler(
@@ -260,4 +318,5 @@ def make_usage_handler(
         session_id=session_id,
         turn_id=turn_id or uuid.uuid4().hex,
         default_worker=default_worker,
+        tenant_id=tenant_id,
     )

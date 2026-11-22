@@ -177,6 +177,9 @@ async def ingest_file(
             })
 
     await to_thread(milvus_client.insert, collection_name=COLLECTION_NAME, data=all_data)
+    # 立即 flush：Milvus 插入后数据在内存段里，默认一致性级别下紧接着的
+    # query（文档列表 / 检索）看不到，表现为「上传成功但列表是空的」
+    await to_thread(milvus_client.flush, COLLECTION_NAME)
     logger.info(f"文档 '{doc_name}' 导入完成，共 {len(all_data)} 个分块")
     return len(all_data)
 
@@ -244,5 +247,11 @@ async def ingest_drug_instructions(
         await to_thread(milvus_client.insert, collection_name=COLLECTION_NAME, data=data)
         total += len(data)
 
+    # 和 ingest_file 同一原因：不 flush 的话数据停在内存段，紧接着的检索/列表看不到，
+    # 表现为"导入完成 0 个分块"或"导入成功但知识库是空的"
+    if total:
+        await to_thread(milvus_client.flush, COLLECTION_NAME)
+        from src.knowledge.bm25_store import invalidate
+        invalidate()  # BM25 索引缓存里还是旧 chunk，不失效就查不到新导入的说明书
     logger.info(f"药品说明书导入完成，共 {total} 个分块")
     return total

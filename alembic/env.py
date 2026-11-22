@@ -24,6 +24,16 @@ from src.knowledge.model import *
 # 管理端平台域：agents / prompts / prompt_versions / system_configs / 会员三表
 # 漏导入会让 autogenerate 把这些表当成"多余"而生成 drop_table。
 from src.modules.platform.model import *
+# 档 A 新增：knowledge_audit_logs（ops 域）
+from src.modules.ops.audit_model import *
+# C4 续新增：admin_audit_logs（管理端写操作审计）
+from src.modules.ops.admin_audit_model import *
+# C3 新增：handoff_tickets（人工接管工单）
+from src.modules.handoff.model import *
+# B1 新增：RBAC 四表（rbac_roles / rbac_permissions / rbac_role_permissions / rbac_subject_roles）
+from src.modules.rbac.model import *
+# B2 新增：clinical_actions（高危动作草稿与确认状态机）
+from src.modules.clinical.model import *
 
 config = context.config
 

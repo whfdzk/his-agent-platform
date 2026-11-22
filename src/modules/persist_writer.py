@@ -18,7 +18,9 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.core.persist_queue import MAX_RETRIES, PersistItem
 from src.infra.database import AsyncSessionLocal
+from src.knowledge.model import Citation
 from src.modules.chat.model import ChatMessage, Conversation
+from src.modules.ops.audit_model import KnowledgeAuditLog
 from src.modules.ops.model import TokenUsage
 from src.modules.ops.trace_model import AgentSpan, AgentTrace, SafetyEvent
 
@@ -155,6 +157,35 @@ async def _insert_safety_events(events: list[dict]) -> None:
             await asyncio.sleep(0.2 * (attempt + 1))
 
 
+async def _insert_knowledge_audits(items: list[dict]) -> None:
+    """知识检索审计：只追加，不改写，因此普通批量 insert。"""
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with AsyncSessionLocal() as session:
+                session.add_all([KnowledgeAuditLog(**it) for it in items])
+                await session.commit()
+            return
+        except Exception as e:
+            if attempt == MAX_RETRIES - 1:
+                logger.warning(f"knowledge_audit_logs 落库失败（丢弃 {len(items)} 条）: {e}")
+                return
+            await asyncio.sleep(0.2 * (attempt + 1))
+
+
+async def _insert_citations(items: list[dict]) -> None:
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with AsyncSessionLocal() as session:
+                session.add_all([Citation(**it) for it in items])
+                await session.commit()
+            return
+        except Exception as e:
+            if attempt == MAX_RETRIES - 1:
+                logger.warning(f"citations 落库失败（丢弃 {len(items)} 条）: {e}")
+                return
+            await asyncio.sleep(0.2 * (attempt + 1))
+
+
 async def write_batch(batch: list[PersistItem]) -> None:
     """消费一个批次：按类型分组后各自批量写入。"""
     messages = [i.payload for i in batch if i.kind == "chat_message"]
@@ -162,6 +193,8 @@ async def write_batch(batch: list[PersistItem]) -> None:
     traces = [i.payload for i in batch if i.kind == "agent_trace"]
     spans = [i.payload for i in batch if i.kind == "agent_span"]
     safety_events = [i.payload for i in batch if i.kind == "safety_event"]
+    audits = [i.payload for i in batch if i.kind == "knowledge_audit"]
+    citations = [i.payload for i in batch if i.kind == "citation"]
     if messages:
         await _insert_messages(messages)
     if usages:
@@ -172,3 +205,7 @@ async def write_batch(batch: list[PersistItem]) -> None:
         await _insert_spans(spans)
     if safety_events:
         await _insert_safety_events(safety_events)
+    if audits:
+        await _insert_knowledge_audits(audits)
+    if citations:
+        await _insert_citations(citations)

@@ -18,7 +18,7 @@ from loguru import logger
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import get_current_user_id
+from src.api.deps import AuthContext, get_current_user_id, require_auth, require_scope
 from src.core.concurrency import to_thread
 from src.core.exceptions import BizErrorCode, BizException
 from src.core.redaction import redact_text
@@ -32,7 +32,7 @@ from src.modules.patient.service import summarize_report
 router = APIRouter(
     prefix="/api/v1/patient/reports",
     tags=["patient-reports"],
-    dependencies=[Depends(get_current_user_id)],
+    dependencies=[Depends(get_current_user_id), Depends(require_scope("report:read"))],
 )
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20MB
@@ -103,6 +103,7 @@ async def _parse_and_store(
                 ReportMetric(
                     report_id=report.id,
                     patient_id=report.patient_id,
+                    tenant_id=int(report.tenant_id or 1),
                     name=item["name"],
                     code=item["code"],
                     category=item["category"],
@@ -144,12 +145,18 @@ async def upload_report(
     file: UploadFile = File(...),
     report_type: str = Form("lab"),
     auto_parse: bool = Form(True),
-    current_user: str = Depends(get_current_user_id),
+    ctx: AuthContext = Depends(require_auth()),
     db: AsyncSession = Depends(get_db),
 ):
     """上传报告（PDF/图片，≤20MB），默认立即解析。"""
-    patient_id = _patient_id(current_user)
-    patient = (await db.execute(select(Patient).where(Patient.id == patient_id))).scalar_one_or_none()
+    patient_id = _patient_id(ctx.subject_id)
+    patient = (
+        await db.execute(
+            select(Patient).where(
+                Patient.id == patient_id, Patient.tenant_id == ctx.tenant_id,
+            )
+        )
+    ).scalar_one_or_none()
     if patient is None:
         raise BizException(BizErrorCode.NOT_FOUND, "患者档案不存在", status_code=404)
 
@@ -183,6 +190,7 @@ async def upload_report(
 
     report = HealthReport(
         patient_id=patient_id,
+        tenant_id=ctx.tenant_id,
         file_name=filename[:255],
         object_key=object_key,
         file_size=len(content),
@@ -202,7 +210,10 @@ async def upload_report(
     metrics = (
         await db.execute(
             select(ReportMetric)
-            .where(ReportMetric.report_id == report.id)
+            .where(
+                ReportMetric.report_id == report.id,
+                ReportMetric.tenant_id == ctx.tenant_id,
+            )
             .order_by(ReportMetric.sort_order.asc())
         )
     ).scalars().all()
@@ -215,14 +226,18 @@ async def upload_report(
 @router.get("")
 async def list_reports(
     limit: int = 20,
-    current_user: str = Depends(get_current_user_id),
+    ctx: AuthContext = Depends(require_auth()),
     db: AsyncSession = Depends(get_db),
 ):
-    patient_id = _patient_id(current_user)
+    patient_id = _patient_id(ctx.subject_id)
     rows = (
         await db.execute(
             select(HealthReport)
-            .where(HealthReport.patient_id == patient_id, HealthReport.deleted_at.is_(None))
+            .where(
+                HealthReport.patient_id == patient_id,
+                HealthReport.tenant_id == ctx.tenant_id,
+                HealthReport.deleted_at.is_(None),
+            )
             .order_by(HealthReport.created_at.desc())
             .limit(max(1, min(limit, 100)))
         )
@@ -235,11 +250,11 @@ async def compare_metrics(
     code: str | None = None,
     name: str | None = None,
     limit: int = 12,
-    current_user: str = Depends(get_current_user_id),
+    ctx: AuthContext = Depends(require_auth()),
     db: AsyncSession = Depends(get_db),
 ):
     """跨报告指标对比：同一指标的历史取值序列。"""
-    patient_id = _patient_id(current_user)
+    patient_id = _patient_id(ctx.subject_id)
     if not code and not name:
         raise BizException(BizErrorCode.PARAM_ERROR, "请指定要对比的指标", status_code=400)
 
@@ -250,8 +265,10 @@ async def compare_metrics(
             .join(HealthReport, HealthReport.id == ReportMetric.report_id)
             .where(
                 ReportMetric.patient_id == patient_id,
+                ReportMetric.tenant_id == ctx.tenant_id,
                 cond,
                 HealthReport.deleted_at.is_(None),
+                HealthReport.tenant_id == ctx.tenant_id,
             )
             .order_by(HealthReport.created_at.asc())
             .limit(max(2, min(limit, 50)))
@@ -292,15 +309,16 @@ async def compare_metrics(
 @router.get("/{report_id}")
 async def get_report(
     report_id: int,
-    current_user: str = Depends(get_current_user_id),
+    ctx: AuthContext = Depends(require_auth()),
     db: AsyncSession = Depends(get_db),
 ):
-    patient_id = _patient_id(current_user)
+    patient_id = _patient_id(ctx.subject_id)
     report = (
         await db.execute(
             select(HealthReport).where(
                 HealthReport.id == report_id,
                 HealthReport.patient_id == patient_id,
+                HealthReport.tenant_id == ctx.tenant_id,
                 HealthReport.deleted_at.is_(None),
             )
         )
@@ -310,7 +328,10 @@ async def get_report(
     metrics = (
         await db.execute(
             select(ReportMetric)
-            .where(ReportMetric.report_id == report.id)
+            .where(
+                ReportMetric.report_id == report.id,
+                ReportMetric.tenant_id == ctx.tenant_id,
+            )
             .order_by(ReportMetric.sort_order.asc())
         )
     ).scalars().all()
@@ -321,15 +342,16 @@ async def get_report(
 @router.post("/{report_id}/parse")
 async def reparse_report(
     report_id: int,
-    current_user: str = Depends(get_current_user_id),
+    ctx: AuthContext = Depends(require_auth()),
     db: AsyncSession = Depends(get_db),
 ):
-    patient_id = _patient_id(current_user)
+    patient_id = _patient_id(ctx.subject_id)
     report = (
         await db.execute(
             select(HealthReport).where(
                 HealthReport.id == report_id,
                 HealthReport.patient_id == patient_id,
+                HealthReport.tenant_id == ctx.tenant_id,
                 HealthReport.deleted_at.is_(None),
             )
         )
@@ -348,7 +370,10 @@ async def reparse_report(
     metrics = (
         await db.execute(
             select(ReportMetric)
-            .where(ReportMetric.report_id == report.id)
+            .where(
+                ReportMetric.report_id == report.id,
+                ReportMetric.tenant_id == ctx.tenant_id,
+            )
             .order_by(ReportMetric.sort_order.asc())
         )
     ).scalars().all()
@@ -358,14 +383,16 @@ async def reparse_report(
 @router.delete("/{report_id}")
 async def delete_report(
     report_id: int,
-    current_user: str = Depends(get_current_user_id),
+    ctx: AuthContext = Depends(require_auth()),
     db: AsyncSession = Depends(get_db),
 ):
-    patient_id = _patient_id(current_user)
+    patient_id = _patient_id(ctx.subject_id)
     report = (
         await db.execute(
             select(HealthReport).where(
-                HealthReport.id == report_id, HealthReport.patient_id == patient_id
+                HealthReport.id == report_id,
+                HealthReport.patient_id == patient_id,
+                HealthReport.tenant_id == ctx.tenant_id,
             )
         )
     ).scalar_one_or_none()

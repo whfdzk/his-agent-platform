@@ -22,11 +22,15 @@ def get_neo4j_driver() -> AsyncDriver:
 
 async def check_neo4j_health() -> bool:
     """
-    检查 Neo4j 连通性。
+    检查 Neo4j 连通性。带 5 秒超时，避免容器不可用时服务启动卡住。
     """
+    import asyncio
     driver = get_neo4j_driver()
-    await driver.verify_connectivity()
-    return True
+    try:
+        await asyncio.wait_for(driver.verify_connectivity(), timeout=5.0)
+        return True
+    except asyncio.TimeoutError:
+        raise RuntimeError("Neo4j 连接超时（5s）")
 
 
 async def close_neo4j_driver() -> None:

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Plus, RefreshCw } from 'lucide-react';
+import { Headset, Plus, RefreshCw } from 'lucide-react';
 import { sessionApi } from '@his/shared';
 import type { ChatMessage } from '@his/shared';
 
@@ -11,12 +11,16 @@ import {
   hasLocalMessages,
   seedSessionMessages,
 } from '../hooks/useChatStream';
+import type { ChatImageAttachment } from '../hooks/useChatStream';
+import { usePatientHandoff } from '../hooks/usePatientHandoff';
 import { useVoiceInput } from '../hooks/useVoiceInput';
 import { recordSession } from '../lib/sessionRegistry';
+import { ImagePrepareError, prepareChatImage } from '../lib/imageUpload';
 import { Sidebar } from '../components/Sidebar';
 import { MessageList } from '../components/chat/MessageList';
 import { ChatInput } from '../components/chat/ChatInput';
 import { ClarifyModal } from '../components/chat/ClarifyModal';
+import { HandoffBar } from '../components/chat/HandoffBar';
 
 export function ChatPage() {
   const { user, userId, sessionId, newSession, switchSession, logout } = useUserSession();
@@ -31,13 +35,22 @@ export function ChatPage() {
     retryLast,
     stop,
     dismissClarify,
+    restorePending,
   } = useChatStream(userId, sessionId);
 
   const backgroundSessions = useBackgroundSessions(sessionId);
 
+  // C3：当前会话的人工工单（状态条 + 坐席回复实时插入）
+  const handoff = usePatientHandoff(userId, sessionId);
+  /** 转人工时带给坐席的摘要：用患者最近一句话，坐席不用翻完整对话 */
+  const lastAsk = [...messages].reverse().find((m) => m.role === 'user')?.content ?? '';
+
   const [input, setInput] = useState('');
+  // 待发送图片：选图后先压缩成 data URL，随本次消息一起发给后端做图像理解
+  const [pendingImage, setPendingImage] = useState<ChatImageAttachment | null>(null);
+  const [imageError, setImageError] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
-  const { voiceState, interim, toggle } = useVoiceInput((text) => setInput(text));
+  const { voiceState, interim, toggle, errorMsg: voiceError } = useVoiceInput((text) => setInput(text));
 
   /** 未登录点"新会话"时按钮旁的提示 */
   const [loginHint, setLoginHint] = useState(false);
@@ -78,20 +91,34 @@ export function ChatPage() {
 
   // 切换到本地无内容的会话时，从后端拉取历史消息填充正文
   // 未登录（游客）没有历史记录，不请求后端（避免 401 与无效请求）
+  //
+  // B2：历史铺好之后再恢复待确认卡片 —— 卡片挂到最后一条助手消息上，
+  // 若在消息列表还是空的时候恢复，会先 push 一条空气泡再被历史覆盖。
   useEffect(() => {
     if (!user || !userId || !sessionId) return;
-    if (hasLocalMessages(sessionId)) return;
     let cancelled = false;
+    const restore = () => {
+      if (!cancelled) void restorePending();
+    };
+
+    if (hasLocalMessages(sessionId)) {
+      restore();
+      return () => {
+        cancelled = true;
+      };
+    }
     sessionApi
       .messages(sessionId, userId)
       .then((r) => {
-        if (!cancelled) seedSessionMessages(sessionId, r.messages);
+        if (cancelled) return;
+        seedSessionMessages(sessionId, r.messages);
+        restore();
       })
-      .catch(() => undefined);
+      .catch(() => restore());
     return () => {
       cancelled = true;
     };
-  }, [user, userId, sessionId]);
+  }, [user, userId, sessionId, restorePending]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -100,13 +127,28 @@ export function ChatPage() {
   const allMessages: ChatMessage[] = [...messages, ...handoffCards];
   const hasError = messages.length > 0 && messages[messages.length - 1].role === 'error';
 
+  const handlePickImage = useCallback(async (file: File) => {
+    setImageError('');
+    try {
+      setPendingImage(await prepareChatImage(file));
+    } catch (e) {
+      setPendingImage(null);
+      setImageError(e instanceof ImagePrepareError ? e.message : '图片处理失败，请换一张重试');
+    }
+  }, []);
+
   const handleSend = () => {
     const text = input;
-    if (!text.trim()) return;
+    const image = pendingImage;
+    if (!text.trim() && !image) return;
     setInput('');
+    setPendingImage(null);
+    setImageError('');
     // 登录用户才登记到本地会话索引（游客不留历史记录）
-    if (user && messages.length === 0) recordSession(userId, sessionId, text);
-    sendMessage(text);
+    if (user && messages.length === 0) {
+      recordSession(userId, sessionId, text.trim() || '（图片咨询）');
+    }
+    void sendMessage(text, undefined, image ?? undefined);
   };
 
   return (
@@ -155,6 +197,25 @@ export function ChatPage() {
                   <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-primary-600" />
                 </span>
                 后台进行中
+              </button>
+            )}
+
+            {/* C3：转人工。坐席没接入前可撤回；已接入则只显示状态，不再重复建单 */}
+            {user && (
+              <button
+                onClick={() => {
+                  if (!handoff.active) void handoff.askHuman(lastAsk);
+                }}
+                disabled={handoff.active || handoff.busy}
+                title={
+                  handoff.active
+                    ? '这张单还在处理中，坐席的回复会直接出现在会话里'
+                    : '让真人坐席接手这个会话'
+                }
+                className="flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:border-slate-300 hover:bg-slate-50 disabled:cursor-not-allowed disabled:border-slate-100 disabled:bg-slate-50 disabled:text-slate-400"
+              >
+                <Headset className="h-3.5 w-3.5" />
+                {handoff.active ? '人工处理中' : handoff.busy ? '转接中…' : '转人工'}
               </button>
             )}
 
@@ -260,6 +321,18 @@ export function ChatPage() {
         {/* 输入区 */}
         <div className="border-t border-slate-200 bg-white">
           <div className="mx-auto w-full max-w-2xl xl:max-w-3xl">
+            {handoff.ticket && (
+              <HandoffBar
+                ticket={handoff.ticket}
+                busy={handoff.busy}
+                error={handoff.error}
+                onCancel={() => void handoff.cancel()}
+                onDismiss={handoff.dismiss}
+              />
+            )}
+            {!handoff.ticket && handoff.error && (
+              <div className="px-4 pb-1 pt-2 text-[11px] text-red-600">{handoff.error}</div>
+            )}
             <ChatInput
               value={input}
               onChange={setInput}
@@ -269,6 +342,11 @@ export function ChatPage() {
               voiceState={voiceState}
               interim={interim}
               onToggleVoice={toggle}
+              voiceError={voiceError}
+              image={pendingImage}
+              onPickImage={(f) => void handlePickImage(f)}
+              onClearImage={() => setPendingImage(null)}
+              imageError={imageError}
             />
           </div>
         </div>

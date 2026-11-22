@@ -49,8 +49,10 @@ TOOL_CATEGORIES: dict[str, str] = {
     "search_knowledge_graph": "知识检索",
     "search_knowledge_sql": "知识检索",
     "search_knowledge_multi": "知识检索",
+    "search_knowledge_agentic": "知识检索",
     "review_prescription_tool": "知识检索",
     "list_knowledge_sources": "知识检索",
+    "request_human_handoff": "人工接管",
 }
 
 # Supervisor 可调度的 worker：code → 调度工具名
@@ -73,7 +75,7 @@ SKILL_CATALOG: list[dict[str, Any]] = [
                   "manage_medication_record", "review_prescription_tool"]},
     {"id": "medical_knowledge", "name": "医学知识检索", "description": "基于医学文档库与知识图谱回答专业问题",
      "tool_ids": ["call_knowledge_agent", "search_knowledge_docs", "search_knowledge_graph",
-                  "search_knowledge_multi", "list_knowledge_sources"]},
+                  "search_knowledge_multi", "search_knowledge_agentic", "list_knowledge_sources"]},
     {"id": "report_interpretation", "name": "检查报告解读", "description": "结合结构化指标解释检查报告",
      "tool_ids": ["call_report_agent", "get_recent_reports"]},
     {"id": "health_management", "name": "健康管理", "description": "管理健康指标、趋势和提醒",
@@ -165,11 +167,18 @@ def _worker_tools() -> list[Any]:
     return list(WORKER_TOOLS)
 
 
+def _handoff_tools() -> list[Any]:
+    from src.tools.handoff_tools import request_human_handoff
+
+    return [request_human_handoff]
+
+
 _TOOL_GROUPS = (
     ("患者数据", _patient_tools),
     ("用药", _medication_tools),
     ("健康管理", _health_tools),
     ("就医辅助", _guide_tools),
+    ("人工接管", _handoff_tools),
     ("记忆", _memory_tools),
     ("知识检索", _knowledge_tools),
     ("Agent 调度", _worker_tools),
@@ -257,8 +266,10 @@ _DISPLAY_NAMES: dict[str, str] = {
     "search_knowledge_graph": "知识图谱检索",
     "search_knowledge_sql": "运营数据 NL2SQL",
     "search_knowledge_multi": "多通道融合检索",
+    "search_knowledge_agentic": "自主多轮检索",
     "review_prescription_tool": "处方审查",
     "list_knowledge_sources": "知识来源列表",
+    "request_human_handoff": "转人工（建工单）",
 }
 
 

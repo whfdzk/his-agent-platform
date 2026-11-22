@@ -88,6 +88,9 @@ class TraceRecorder:
         self.tool_names: list[str] = []
         self.retrieval_sources: list[dict] = []
         self.retrieval_count = 0
+        # 引用核查结论（None=本轮未核查）：写在这里而不是回传调用方，
+        # 是为了让审计落库能直接读到，不必给每个检索通道加一个返回值
+        self.grounded: bool | None = None
         self.safety_level = "info"
         self.safety_result = "allow"
         self.safety_rules: list[str] = []
@@ -197,15 +200,28 @@ class TraceRecorder:
         self.agent_calls += 1
 
     def add_retrieval(self, engine: str, items: list[dict], top_k: int = 0) -> None:
-        """记录一次检索：只保留 doc_id/score 等元信息，不保留正文。"""
+        """记录一次检索：保留引用定位（文档/页码/片段序号/摘句）与分数，不保留整段正文。
+
+        这些字段同时是 citation（回答引用）的数据来源：回答正文里的"依据哪份资料
+        第几页"必须可回溯，否则无法核对模型有没有编造出处。
+        """
         safe_items = []
         for item in items[:20]:
             safe_items.append({
                 "engine": engine,
                 "source": redact_text(str(item.get("source") or item.get("doc_name") or ""), 80),
                 "doc_id": redact_text(str(item.get("doc_id") or item.get("id") or ""), 64),
+                "doc_name": redact_text(str(item.get("doc_name") or item.get("title") or ""), 120),
+                "doc_type": str(item.get("doc_type") or "")[:40],
+                "page_number": item.get("page_number"),
+                "chunk_index": item.get("chunk_index"),
                 "score": item.get("score"),
+                # 分数语义：vector=余弦相似度 / rerank=精排分 / rrf=融合排名分 / bm25=关键词分。
+                # 量纲不同（实测出现过 21.66 与 0.56 并存），不标类型就没法按分数排序或设阈值
+                "score_type": str(item.get("score_type") or "vector")[:16],
                 "title": redact_text(str(item.get("title") or item.get("doc_name") or ""), 80),
+                # 摘句只留 120 字且过 PHI 正则：够定位原文，又不会把整段病历带进库
+                "quote": redact_text(str(item.get("text") or ""), 120),
             })
         self.retrieval_sources.extend(safe_items)
         self.retrieval_count += len(safe_items or [])

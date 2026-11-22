@@ -9,21 +9,27 @@
 # ============================================================
 
 import sqlalchemy as sa
-from sqlalchemy import String, Text, Integer, Float, Boolean, ForeignKey, Index
+from sqlalchemy import String, Text, Integer, Float, Boolean, ForeignKey, Index, BigInteger, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
-from src.core.base_model import BaseModel
+from src.core.base_model import BaseModel, TenantMixin
 
 # ----------------------------------------------------------
 # 科室表
 # 来源：medical.json 中的 departments 字段
 # 用途：分诊推荐（症状→疾病→科室 图路径的终点）
 # ----------------------------------------------------------
-class Department(BaseModel):
+class Department(BaseModel, TenantMixin):
     __tablename__ = "departments"
 
-    name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, comment="科室名称，如：内科、外科")
+    name: Mapped[str] = mapped_column(String(100), nullable=False, comment="科室名称，如：内科、外科")
     description: Mapped[str | None] = mapped_column(Text, comment="科室简介")
+
+    __table_args__ = (
+        # 同一家医院内科室名唯一；跨租户允许同名（R5 验收点）
+        UniqueConstraint("tenant_id", "name", name="uq_departments_tenant_name"),
+        Index("ix_departments_tenant", "tenant_id"),
+    )
 
 # ----------------------------------------------------------
 # 疾病表
@@ -32,10 +38,10 @@ class Department(BaseModel):
 #   1. 分诊病因分析的结构化查询
 #   2. 疾病百科文本切片后入 Milvus 向量索引
 # ----------------------------------------------------------
-class Disease(BaseModel):
+class Disease(BaseModel, TenantMixin):
     __tablename__ = "diseases"
 
-    name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False, comment="疾病名称")
+    name: Mapped[str] = mapped_column(String(200), nullable=False, comment="疾病名称")
     department_id: Mapped[int | None] = mapped_column(
         ForeignKey("departments.id", ondelete="SET NULL"),
         comment="所属科室 ID"
@@ -50,7 +56,9 @@ class Disease(BaseModel):
     cost_money: Mapped[str | None] = mapped_column(String(200), comment="参考费用区间")
 
     __table_args__ = (
+        UniqueConstraint("tenant_id", "name", name="uq_diseases_tenant_name"),
         Index("ix_diseases_name", "name"),
+        Index("ix_diseases_tenant", "tenant_id"),
     )
 
 # ----------------------------------------------------------
@@ -58,13 +66,15 @@ class Disease(BaseModel):
 # 来源：medical.json 中 symptom 字段拆分
 # 用途：症状结构化提取后的实体匹配
 # ----------------------------------------------------------
-class Symptom(BaseModel):
+class Symptom(BaseModel, TenantMixin):
     __tablename__ = "symptoms"
 
-    name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False, comment="症状名称，如：发热、头痛")
+    name: Mapped[str] = mapped_column(String(200), nullable=False, comment="症状名称，如：发热、头痛")
 
     __table_args__ = (
+        UniqueConstraint("tenant_id", "name", name="uq_symptoms_tenant_name"),
         Index("ix_symptoms_name", "name"),
+        Index("ix_symptoms_tenant", "tenant_id"),
     )
 
 # ----------------------------------------------------------
@@ -72,7 +82,7 @@ class Symptom(BaseModel):
 # 来源：medical.json 中 symptom 字段
 # 用途：症状→疾病推断的结构化查询（同时也会导入 Neo4j 作为图关系）
 # ----------------------------------------------------------
-class DiseaseSymptom(BaseModel):
+class DiseaseSymptom(BaseModel, TenantMixin):
     __tablename__ = "disease_symptoms"
 
     disease_id: Mapped[int] = mapped_column(
@@ -89,6 +99,7 @@ class DiseaseSymptom(BaseModel):
     __table_args__ = (
         Index("ix_disease_symptoms_disease", "disease_id"),
         Index("ix_disease_symptoms_symptom", "symptom_id"),
+        Index("ix_disease_symptoms_tenant", "tenant_id"),
     )
 
 # ----------------------------------------------------------
@@ -99,7 +110,7 @@ class DiseaseSymptom(BaseModel):
 #   2. 药品说明书 RAG（功能 3.5）
 #   3. NL2SQL 药品统计（功能 5.5）
 # ----------------------------------------------------------
-class Drug(BaseModel):
+class Drug(BaseModel, TenantMixin):
     __tablename__ = "drugs"
 
     name: Mapped[str] = mapped_column(String(200), nullable=False, comment="药品通用名")
@@ -115,6 +126,7 @@ class Drug(BaseModel):
     __table_args__ = (
         Index("ix_drugs_name", "name"),
         Index("ix_drugs_category", "category"),
+        Index("ix_drugs_tenant", "tenant_id"),
     )
 
 # ----------------------------------------------------------
@@ -122,12 +134,11 @@ class Drug(BaseModel):
 # 单独拆出来是因为这些字段都是长文本，查列表时不需要加载
 # 用途：药品说明书问答 RAG 的原始文本来源（功能 3.5）
 # ----------------------------------------------------------
-class DrugDetail(BaseModel):
+class DrugDetail(BaseModel, TenantMixin):
     __tablename__ = "drug_details"
 
     drug_id: Mapped[int] = mapped_column(
         ForeignKey("drugs.id", ondelete="CASCADE"),
-        unique=True,
         nullable=False,
         comment="关联药品 ID"
     )
@@ -141,12 +152,17 @@ class DrugDetail(BaseModel):
     storage: Mapped[str | None] = mapped_column(Text, comment="储存条件")
     full_instruction: Mapped[str | None] = mapped_column(Text, comment="完整说明书原文（RAG 切片用）")
 
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "drug_id", name="uq_drug_details_tenant_drug"),
+        Index("ix_drug_details_tenant", "tenant_id"),
+    )
+
 # ----------------------------------------------------------
 # 疾病-药品关联表（多对多）
 # 来源：medical.json 中 common_drug / recommand_drug 字段
 # 用途：药物查询时关联疾病上下文；同时导入 Neo4j 作为图关系
 # ----------------------------------------------------------
-class DiseaseDrug(BaseModel):
+class DiseaseDrug(BaseModel, TenantMixin):
     __tablename__ = "disease_drugs"
 
     disease_id: Mapped[int] = mapped_column(
@@ -167,6 +183,7 @@ class DiseaseDrug(BaseModel):
     __table_args__ = (
         Index("ix_disease_drugs_disease", "disease_id"),
         Index("ix_disease_drugs_drug", "drug_id"),
+        Index("ix_disease_drugs_tenant", "tenant_id"),
     )
 
 # ----------------------------------------------------------
@@ -176,7 +193,7 @@ class DiseaseDrug(BaseModel):
 #   2. 患者群体分析 NL2SQL
 #   3. 患者画像构建
 # ----------------------------------------------------------
-class Hospital(BaseModel):
+class Hospital(BaseModel, TenantMixin):
     """医院信息：GuideAgent 的「医院信息查询」数据来源。
 
     只存公开可查的机构信息（名称/等级/地址/门诊时间），不含任何患者数据。
@@ -184,7 +201,7 @@ class Hospital(BaseModel):
 
     __tablename__ = "hospitals"
 
-    name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, comment="医院名称")
+    name: Mapped[str] = mapped_column(String(100), nullable=False, comment="医院名称")
     level: Mapped[str | None] = mapped_column(String(20), comment="等级：三级甲等/三级乙等/二级/社区")
     hospital_type: Mapped[str | None] = mapped_column(String(20), comment="类型：综合/专科/中医/社区")
     province: Mapped[str | None] = mapped_column(String(30), comment="省份")
@@ -196,10 +213,14 @@ class Hospital(BaseModel):
     intro: Mapped[str | None] = mapped_column(Text, comment="医院简介")
     departments: Mapped[str | None] = mapped_column(Text, comment="重点科室，逗号分隔")
 
-    __table_args__ = (Index("ix_hospitals_city", "city"),)
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name", name="uq_hospitals_tenant_name"),
+        Index("ix_hospitals_city", "city"),
+        Index("ix_hospitals_tenant", "tenant_id"),
+    )
 
 
-class Patient(BaseModel):
+class Patient(BaseModel, TenantMixin):
     __tablename__ = "patients"
 
     name: Mapped[str] = mapped_column(String(100), nullable=False, comment="患者姓名")
@@ -218,6 +239,10 @@ class Patient(BaseModel):
     __table_args__ = (
         Index("ix_patients_name", "name"),
         Index("ix_patients_phone", "phone"),
+        Index("ix_patients_tenant", "tenant_id"),
+        # C1 热路径：同一手机号/姓名在不同租户下允许重复，查询按 (tenant_id, phone) 走
+        Index("ix_patients_tenant_phone", "tenant_id", "phone"),
+        Index("ix_patients_tenant_name", "tenant_id", "name"),
     )
 
 # ----------------------------------------------------------
@@ -226,7 +251,7 @@ class Patient(BaseModel):
 #   1. 问诊 agent 移交（handle_handoff）后的挂号结果落库
 #   2. 患者端"我的预约"日历查询
 # ----------------------------------------------------------
-class Appointment(BaseModel):
+class Appointment(BaseModel, TenantMixin):
     __tablename__ = "appointments"
 
     patient_id: Mapped[int | None] = mapped_column(
@@ -236,6 +261,10 @@ class Appointment(BaseModel):
     session_id: Mapped[str | None] = mapped_column(String(100), comment="关联的会话 ID")
     appointment_no: Mapped[str] = mapped_column(String(32), unique=True, nullable=False, comment="预约号，如 APT1A2B3C4D")
     doctor_name: Mapped[str] = mapped_column(String(100), default="", comment="医生姓名及职称")
+    doctor_clinician_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True,
+        comment="接诊医生账号（patients.id）；有值时接诊后自动建立 clinician_patients(consulted)",
+    )
     department: Mapped[str] = mapped_column(String(100), default="", comment="就诊科室名称")
     date: Mapped[str] = mapped_column(String(20), default="", comment="就诊日期，YYYY-MM-DD")
     time_slot: Mapped[str] = mapped_column(String(50), default="", comment="就诊时段")
@@ -247,6 +276,9 @@ class Appointment(BaseModel):
     __table_args__ = (
         Index("ix_appointments_patient", "patient_id"),
         Index("ix_appointments_session", "session_id"),
+        Index("ix_appointments_doctor_clinician", "doctor_clinician_id"),
+        Index("ix_appointments_tenant", "tenant_id"),
+        Index("ix_appointments_tenant_doctor_date", "tenant_id", "doctor_name", "date"),
     )
 
 # ----------------------------------------------------------
@@ -256,7 +288,7 @@ class Appointment(BaseModel):
 #   2. 报告趋势对比
 #   3. 运营数据查询 NL2SQL
 # ----------------------------------------------------------
-class Consultation(BaseModel):
+class Consultation(BaseModel, TenantMixin):
     __tablename__ = "consultations"
 
     patient_id: Mapped[int] = mapped_column(
@@ -282,4 +314,5 @@ class Consultation(BaseModel):
         Index("ix_consultations_department", "department_id"),
         # 问诊趋势 / 症状 TopN 都按时间窗口扫描
         Index("ix_consultations_created_at", "created_at"),
+        Index("ix_consultations_tenant", "tenant_id"),
     )

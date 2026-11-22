@@ -18,12 +18,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agents.supervisor_agent import get_supervisor_checkpointer
 from src.agents.inquiry.state import InquiryState
+from src.core.exceptions import BizErrorCode, BizException
 from src.infra.database import get_db, AsyncSessionLocal
 from src.infra.redis_cache import get_checkpointer_redis
 from src.modules.medical.model import Consultation
-from src.api.deps import get_current_user_id
+from src.api.deps import AuthContext, get_current_user_id, require_auth, require_scope
 
-router = APIRouter(prefix="/api/v1/sessions", tags=["sessions"])
+router = APIRouter(
+    prefix="/api/v1/sessions", tags=["sessions"],
+    # 会话历史属于问诊数据：B1 起按 chat:read 收紧（护士只读、患者本人可读）
+    dependencies=[Depends(require_scope("chat:read"))],
+)
 
 
 def _msg_to_dict(m) -> dict | None:
@@ -67,18 +72,22 @@ async def _inquiry_state_title(raw) -> str:
 
 
 @router.get("")
-async def list_sessions(limit: int = 50, current_user: str = Depends(get_current_user_id)):
+async def list_sessions(limit: int = 50, ctx: AuthContext = Depends(require_auth())):
     """
     会话列表（仅当前登录用户自己的会话，user_id 从 JWT 取，不可伪造）。
     - 活跃问诊会话：SCAN Redis inquiry_state:{user_id}:{session_id} + MGET 批量获取
     - 历史会话：consultations 表 + conversations 表（同一 DB 连接查询）
     - 加 Redis 缓存（TTL 30s），减少重复查询
+
+    C1：会话查询除 user_id 还带 tenant_id —— 单靠 user_id 时，
+    同一主体 id 在别的租户里存在同号记录（影子数据）会串号。
     """
-    user_id = current_user
+    user_id = ctx.subject_id
+    tenant_id = ctx.tenant_id
     redis = get_checkpointer_redis()
 
-    # 缓存键：sessions_list:{user_id}:{limit}
-    cache_key = f"sessions_list:{user_id}:{limit}"
+    # 缓存键带租户：不同租户下同 user_id 的列表不能互相命中
+    cache_key = f"sessions_list:{tenant_id}:{user_id}:{limit}"
     cached = await redis.get(cache_key)
     if cached:
         import json
@@ -114,7 +123,12 @@ async def list_sessions(limit: int = 50, current_user: str = Depends(get_current
     try:
         async with AsyncSessionLocal() as db:
             # 2.1 consultations 表
-            q = select(Consultation).order_by(Consultation.created_at.desc()).limit(limit * 2)
+            q = (
+                select(Consultation)
+                .where(Consultation.tenant_id == tenant_id)
+                .order_by(Consultation.created_at.desc())
+                .limit(limit * 2)
+            )
             if user_id.isdigit():
                 q = q.where(Consultation.patient_id == int(user_id))
             rows = (await db.execute(q)).scalars().all()
@@ -130,30 +144,15 @@ async def list_sessions(limit: int = 50, current_user: str = Depends(get_current
                 }
 
             # 2.2 conversations 表（同一连接）
-            from src.modules.chat.model import ChatMessage, Conversation
+            # 优化：去掉标题兜底查询（懒加载，不在列表接口里查）
+            from src.modules.chat.model import Conversation
             convs = (await db.execute(
                 select(Conversation)
-                .where(Conversation.user_id == user_id)
+                .where(Conversation.user_id == user_id, Conversation.tenant_id == tenant_id)
                 .order_by(Conversation.last_active_at.desc().nullslast(),
                           Conversation.updated_at.desc())
                 .limit(limit)
             )).scalars().all()
-
-            # 标题兜底：conversations.title 为空时取首条用户消息
-            missing = [c.id for c in convs if not c.title]
-            title_map: dict[int, str] = {}
-            if missing:
-                first_msgs = (await db.execute(
-                    select(ChatMessage.conversation_id, ChatMessage.content)
-                    .where(
-                        ChatMessage.conversation_id.in_(missing),
-                        ChatMessage.role == "user",
-                        ChatMessage.content != "",
-                    )
-                    .order_by(ChatMessage.conversation_id, ChatMessage.seq.asc())
-                )).all()
-                for conv_id, content in first_msgs:
-                    title_map.setdefault(conv_id, (content or "").strip()[:50])
 
             for conv in convs:
                 sid = conv.session_id
@@ -162,7 +161,7 @@ async def list_sessions(limit: int = 50, current_user: str = Depends(get_current
                 sessions[sid] = {
                     "session_id": sid,
                     "user_id": user_id,
-                    "title": conv.title or title_map.get(conv.id) or "历史会话",
+                    "title": conv.title or "历史会话",
                     "is_inquiry_active": False,
                     "last_active_at": _utc_iso(conv.last_active_at or conv.updated_at),
                 }
@@ -176,21 +175,25 @@ async def list_sessions(limit: int = 50, current_user: str = Depends(get_current
     )
     result = {"sessions": items[:limit], "total": len(items)}
 
-    # 写入缓存（TTL 30s）
+    # 写入缓存（TTL 5分钟，减少重复查询）
     import json
-    await redis.setex(cache_key, 30, json.dumps(result, ensure_ascii=False))
+    await redis.setex(cache_key, 300, json.dumps(result, ensure_ascii=False))
 
     return result
 
 
 @router.get("/{session_id}/messages")
-async def get_session_messages(session_id: str, current_user: str = Depends(get_current_user_id)):
+async def get_session_messages(session_id: str, ctx: AuthContext = Depends(require_auth())):
     """
     会话消息历史（只读回放，仅本人会话）。
     数据源优先级：PG chat_messages（source of truth）→ checkpointer / InquiryState 补充；
     两路数据按 (role, content) 去重。
+
+    C1：归属判定是 (tenant_id, session_id) + 本人 user_id。
+    只比对 user_id 时，另一租户里同 user_id 的会话也会被读出来（200 而非 404）。
     """
-    user_id = current_user
+    user_id = ctx.subject_id
+    tenant_id = ctx.tenant_id
     thread_id = f"{user_id}:{session_id}"
     messages: list[dict] = []
     seen: set[tuple[str, str]] = set()
@@ -199,6 +202,8 @@ async def get_session_messages(session_id: str, current_user: str = Depends(get_
         if not d:
             return
         content = d["content"].strip()
+        if not content:
+            return
         key = (d["role"], content)
         if key in seen:
             return
@@ -212,19 +217,34 @@ async def get_session_messages(session_id: str, current_user: str = Depends(get_
                 if prev.startswith(content) or content.startswith(prev):
                     return
         seen.add(key)
-        messages.append(d)
+        messages.append(
+            {
+                "role": d["role"],
+                "content": d["content"],
+                # seq 与 event_type 只有 PG 有；checkpointer / InquiryState 补出来的消息
+                # 没有这些字段，前端按 event_type 缺省成普通气泡。
+                "seq": d.get("seq"),
+                "event_type": d.get("event_type"),
+            }
+        )
 
     # 1. PG 持久化消息（source of truth）
     try:
         from src.modules.chat.model import Conversation, ChatMessage
 
         async with AsyncSessionLocal() as db:
+            # 先按 session_id 查会话（不带租户条件），归属不对直接 404：
+            # - 别的租户里有这个 session_id → 404（不能因为"不在我的租户"就当会话不存在返回空列表，
+            #   那样调用方会以为读到了别人的会话且内容为空，语义错误）
+            # - 同租户但不是本人 → 404（不暴露存在性）
+            # 查不到任何会话才继续走 checkpointer / InquiryState（thread_id 已按 user_id 隔离）
             conv = (await db.execute(
-                select(Conversation).where(
-                    Conversation.user_id == user_id,
-                    Conversation.session_id == session_id,
-                )
-            )).scalar_one_or_none()
+                select(Conversation).where(Conversation.session_id == session_id)
+            )).scalars().first()
+            if conv is not None and (
+                int(conv.tenant_id) != int(tenant_id) or str(conv.user_id) != str(user_id)
+            ):
+                raise BizException(BizErrorCode.NOT_FOUND, "会话不存在", status_code=404)
             if conv is not None:
                 rows = (await db.execute(
                     select(ChatMessage)
@@ -237,7 +257,17 @@ async def get_session_messages(session_id: str, current_user: str = Depends(get_
                     .limit(500)
                 )).scalars().all()
                 for m in rows:
-                    _push({"role": m.role, "content": m.content})
+                    # content 用脱敏列：回放属于对外展示，原文列只留审计追溯
+                    _push(
+                        {
+                            "role": m.role,
+                            "content": m.content_redacted or m.content,
+                            "seq": int(m.seq),
+                            "event_type": str(m.event_type or "token"),
+                        }
+                    )
+    except BizException:
+        raise
     except Exception as e:
         logger.warning(f"chat_messages 历史读取失败: {e}")
 

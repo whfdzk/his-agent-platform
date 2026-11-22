@@ -29,6 +29,8 @@ class CandidateDisease(BaseModel):
     department: str = ""
     checks: list[str] = Field(default_factory=list)
     complications: list[str] = Field(default_factory=list)  # ACOMPANY_WITH 关系
+    # 易感人群（图谱 easy_get 字段，如"儿童""女性""无特定人群"），用于按患者年龄/性别过滤
+    easy_get: str = ""
 
 
 # ── 患者上下文（从外部系统加载） ─────────────────────────────────────────
@@ -83,6 +85,8 @@ class InquiryState(BaseModel):
     # 结论
     handoff_payload: InquiryHandoffPayload | None = None
     force_conclude: bool = False      # True = 达到 10 轮强制结束
+    # 急症分级结果（B3）：red / orange / yellow / green，空串表示未判定
+    emergency_level: str = ""
 
     # 节点间临时传递数据
     pending_ask_symptoms: list[str] = Field(default_factory=list)  # 本轮准备追问的症状

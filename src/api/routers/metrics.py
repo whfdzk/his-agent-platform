@@ -1,7 +1,8 @@
 # src/api/routers/metrics.py
 #
 # Prometheus 指标端点（/metrics，由 Nginx 内网 ACL 保护）。
-# prometheus_client 未安装时降级为手写文本格式，保证端点始终可用。
+# 指标对象统一定义在 src/core/metrics.py（写入方分散在中间件/LLM 回调/检索层），
+# 这里只做鉴权与导出；prometheus_client 未安装时降级为手写文本格式。
 
 from __future__ import annotations
 
@@ -12,21 +13,15 @@ from fastapi import APIRouter, Request, Response
 from src.core.concurrency import llm_in_flight, sse_limiter
 from src.core.config import get_settings
 from src.core.exceptions import BizErrorCode, BizException
+from src.core.metrics import (
+    CONTENT_TYPE_LATEST,
+    LLM_IN_FLIGHT,
+    SSE_CONNS,
+    _HAVE_PROM,
+    generate_latest,
+)
 
 router = APIRouter(tags=["metrics"])
-
-try:
-    from prometheus_client import Gauge, Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
-
-    _HAVE_PROM = True
-    SSE_CONNS = Gauge("sse_active_connections", "当前 SSE 活跃连接数（本进程）")
-    LLM_IN_FLIGHT = Gauge("llm_requests_in_flight", "在途 LLM 请求数（本进程）")
-    HTTP_REQUESTS = Counter("http_requests_total", "HTTP 请求总数", ["method", "path", "status"])
-    HTTP_LATENCY = Histogram("http_request_duration_seconds", "HTTP 请求延迟", ["method", "path"])
-    AGENT_TASKS = Counter("agent_tasks_total", "Agent 任务总数", ["agent", "status"])
-    RAG_HITS = Counter("rag_hits_total", "RAG 检索命中数", ["category"])
-except ImportError:  # pragma: no cover
-    _HAVE_PROM = False
 
 
 def _authorize(request: Request) -> None:
@@ -81,5 +76,5 @@ async def metrics(request: Request) -> Response:
         lines.append(f"process_resident_memory_bytes {rss}")
     except Exception:
         pass
-    lines.append(f"app_env{{env=\"{settings.APP_ENV}\"}} 1")
+    lines.append(f'app_env{{env="{settings.APP_ENV}"}} 1')
     return Response(content="\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")

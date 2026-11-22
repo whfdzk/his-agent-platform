@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import get_current_admin
+from src.api.deps import AdminIdentity, get_current_admin
 from src.core.exceptions import BizErrorCode, BizException
 from src.infra.database import get_db
 from src.modules.platform.model import MembershipOrder, MembershipPlan, UserMembership
@@ -62,16 +62,26 @@ class OrderCreate(BaseModel):
 
 
 @router.get("/plans")
-async def list_plans(db: AsyncSession = Depends(get_db)):
+async def list_plans(
+    admin: AdminIdentity = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
     rows = (await db.execute(
-        select(MembershipPlan).order_by(MembershipPlan.sort_order, MembershipPlan.id)
+        select(MembershipPlan)
+        .where(MembershipPlan.tenant_id == admin.tenant_id)
+        .order_by(MembershipPlan.sort_order, MembershipPlan.id)
     )).scalars().all()
     return {"plans": [_serialize_plan(p) for p in rows], "total": len(rows)}
 
 
 @router.post("/plans")
-async def create_plan(req: PlanUpsert, db: AsyncSession = Depends(get_db)):
+async def create_plan(
+    req: PlanUpsert,
+    admin: AdminIdentity = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
     plan = MembershipPlan(
+        tenant_id=admin.tenant_id,
         name=req.name, price_cents=req.price_cents, duration_days=req.duration_days,
         benefits=json.dumps(req.benefits, ensure_ascii=False),
         enabled=req.enabled, sort_order=req.sort_order,
@@ -82,9 +92,14 @@ async def create_plan(req: PlanUpsert, db: AsyncSession = Depends(get_db)):
 
 
 @router.put("/plans/{plan_id}")
-async def update_plan(plan_id: int, req: PlanUpsert, db: AsyncSession = Depends(get_db)):
+async def update_plan(
+    plan_id: int,
+    req: PlanUpsert,
+    admin: AdminIdentity = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
     plan = await db.get(MembershipPlan, plan_id)
-    if not plan:
+    if not plan or int(plan.tenant_id or 1) != int(admin.tenant_id):
         raise BizException(BizErrorCode.NOT_FOUND, "套餐不存在", status_code=404)
     plan.name = req.name
     plan.price_cents = req.price_cents
@@ -97,13 +112,20 @@ async def update_plan(plan_id: int, req: PlanUpsert, db: AsyncSession = Depends(
 
 
 @router.delete("/plans/{plan_id}")
-async def delete_plan(plan_id: int, db: AsyncSession = Depends(get_db)):
+async def delete_plan(
+    plan_id: int,
+    admin: AdminIdentity = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
     plan = await db.get(MembershipPlan, plan_id)
-    if not plan:
+    if not plan or int(plan.tenant_id or 1) != int(admin.tenant_id):
         raise BizException(BizErrorCode.NOT_FOUND, "套餐不存在", status_code=404)
     # 有订单引用时只做下架，保证订单快照可追溯
     order_count = (await db.execute(
-        select(func.count()).select_from(MembershipOrder).where(MembershipOrder.plan_id == plan_id)
+        select(func.count()).select_from(MembershipOrder).where(
+            MembershipOrder.plan_id == plan_id,
+            MembershipOrder.tenant_id == admin.tenant_id,
+        )
     )).scalar() or 0
     if order_count:
         plan.enabled = False
@@ -120,11 +142,12 @@ async def list_orders(
     user_id: str | None = None,
     page: int = 1,
     page_size: int = 20,
+    admin: AdminIdentity = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
     page = max(page, 1)
     page_size = min(max(page_size, 1), 100)
-    q = select(MembershipOrder)
+    q = select(MembershipOrder).where(MembershipOrder.tenant_id == admin.tenant_id)
     if status:
         q = q.where(MembershipOrder.status == status)
     if user_id:
@@ -154,16 +177,21 @@ async def list_orders(
 
 
 @router.post("/orders")
-async def create_order(req: OrderCreate, db: AsyncSession = Depends(get_db)):
+async def create_order(
+    req: OrderCreate,
+    admin: AdminIdentity = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
     """人工核销：创建已支付订单并开通/顺延会员。"""
     plan = await db.get(MembershipPlan, req.plan_id)
-    if not plan:
+    if not plan or int(plan.tenant_id or 1) != int(admin.tenant_id):
         raise BizException(BizErrorCode.NOT_FOUND, "套餐不存在", status_code=404)
 
     order_no = "MB" + datetime.now().strftime("%Y%m%d%H%M%S") + "".join(
         random.choices(string.ascii_uppercase + string.digits, k=4)
     )
     order = MembershipOrder(
+        tenant_id=admin.tenant_id,
         order_no=order_no, user_id=req.user_id, plan_id=plan.id,
         plan_name=plan.name, amount_cents=plan.price_cents, status="paid",
     )
@@ -172,7 +200,10 @@ async def create_order(req: OrderCreate, db: AsyncSession = Depends(get_db)):
     # 开通/续费：同用户单条订阅记录，未过期顺延，过期/不存在则重新起算
     now = datetime.now(timezone.utc)
     sub = (await db.execute(
-        select(UserMembership).where(UserMembership.user_id == req.user_id).limit(1)
+        select(UserMembership).where(
+            UserMembership.user_id == req.user_id,
+            UserMembership.tenant_id == admin.tenant_id,
+        ).limit(1)
     )).scalar_one_or_none()
     base = now
     if sub and sub.expire_at:
@@ -192,6 +223,7 @@ async def create_order(req: OrderCreate, db: AsyncSession = Depends(get_db)):
         sub.status = "active"
     else:
         db.add(UserMembership(
+            tenant_id=admin.tenant_id,
             user_id=req.user_id, plan_id=plan.id, plan_name=plan.name,
             start_at=start_at.isoformat(timespec="seconds"),
             expire_at=expire_at.isoformat(timespec="seconds"), status="active",
@@ -201,9 +233,14 @@ async def create_order(req: OrderCreate, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/subscriptions")
-async def list_subscriptions(db: AsyncSession = Depends(get_db)):
+async def list_subscriptions(
+    admin: AdminIdentity = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
     rows = (await db.execute(
-        select(UserMembership).order_by(UserMembership.expire_at.desc().nullslast()).limit(200)
+        select(UserMembership)
+        .where(UserMembership.tenant_id == admin.tenant_id)
+        .order_by(UserMembership.expire_at.desc().nullslast()).limit(200)
     )).scalars().all()
     return {
         "subscriptions": [

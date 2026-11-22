@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from src.core.config import get_llm
+from src.core.concurrency import to_thread
 from src.infra.embedding import get_embeddings
 from src.infra.milvus_client import aget_milvus_client_alias, get_milvus_client
 from src.infra.neo4j_client import get_neo4j_driver
@@ -15,7 +16,7 @@ from src.infra.neo4j_client import get_neo4j_driver
 # ── 依赖注入容器（在 graph 编译时注入，避免全局单例） ──────────────────────
 class InquiryDeps:
     def __init__(self, llm, neo4j_driver, embedding_model, milvus_client, db_session,
-                 persist: bool = True):
+                 persist: bool = True, tenant_id: int = 1):
         self.llm = llm
         self.neo4j_driver = neo4j_driver
         self.embedding_model = embedding_model
@@ -24,9 +25,11 @@ class InquiryDeps:
         # persist=False：游客模式 —— 不写问诊记录/预约等持久化数据，
         # 状态只存在 Redis（会话级短期记忆，1 小时过期）
         self.persist = persist
+        # C1：问诊过程里的写库（急症事件、挂号意向）都带这个租户
+        self.tenant_id = int(tenant_id or 1)
 
 
-async def build_inquiry_deps(db_session=None, persist: bool = True) -> InquiryDeps:
+async def build_inquiry_deps(db_session=None, persist: bool = True, tenant_id: int = 1) -> InquiryDeps:
     """
     构建问诊依赖注入容器的工厂函数。
     供 call_inquiry_agent 工具和 FastAPI 路由共用，避免重复代码。
@@ -41,7 +44,9 @@ async def build_inquiry_deps(db_session=None, persist: bool = True) -> InquiryDe
         llm=llm,
         neo4j_driver=neo4j_driver,
         embedding_model=get_embeddings(),
-        milvus_client=get_milvus_client(),
+        # 建连是同步 IO，放进线程池避免阻塞事件循环
+        milvus_client=await to_thread(get_milvus_client),
         db_session=db_session,
         persist=persist,
+        tenant_id=tenant_id,
     )

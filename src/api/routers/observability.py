@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import get_current_admin
+from src.api.deps import AdminIdentity, get_current_admin
 from src.modules.ops.retention import purge_expired, retention_stats
 from src.infra.database import get_db
 from src.modules.ops.trace_model import AgentSpan, AgentTrace, SafetyEvent
@@ -100,12 +100,13 @@ async def list_traces(
     days: int = 7,
     limit: int = 50,
     offset: int = 0,
+    admin: AdminIdentity = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    since = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 90)))
+    since = datetime.utcnow() - timedelta(days=max(1, min(days, 90)))
     q = (
         select(AgentTrace)
-        .where(AgentTrace.created_at >= since)
+        .where(AgentTrace.created_at >= since, AgentTrace.tenant_id == admin.tenant_id)
         .order_by(AgentTrace.created_at.desc())
         .limit(max(1, min(limit, 200)))
         .offset(max(0, offset))
@@ -127,21 +128,34 @@ async def list_traces(
 @router.get("/traces/{trace_id}")
 async def get_trace(
     trace_id: str,
+    admin: AdminIdentity = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
     trace = (
-        await db.execute(select(AgentTrace).where(AgentTrace.trace_id == trace_id))
+        await db.execute(
+            select(AgentTrace).where(
+                AgentTrace.trace_id == trace_id,
+                AgentTrace.tenant_id == admin.tenant_id,
+            )
+        )
     ).scalar_one_or_none()
     if trace is None:
         return {"trace": None, "spans": [], "events": []}
     spans = (
         await db.execute(
-            select(AgentSpan).where(AgentSpan.trace_id == trace_id).order_by(AgentSpan.id.asc())
+            select(AgentSpan)
+            .where(AgentSpan.trace_id == trace_id, AgentSpan.tenant_id == admin.tenant_id)
+            .order_by(AgentSpan.id.asc())
         )
     ).scalars().all()
     events = (
         await db.execute(
-            select(SafetyEvent).where(SafetyEvent.trace_id == trace_id).order_by(SafetyEvent.id.asc())
+            select(SafetyEvent)
+            .where(
+                SafetyEvent.trace_id == trace_id,
+                SafetyEvent.tenant_id == admin.tenant_id,
+            )
+            .order_by(SafetyEvent.id.asc())
         )
     ).scalars().all()
     return {
@@ -164,25 +178,39 @@ async def get_trace(
 
 
 @router.get("/stats")
-async def trace_stats(days: int = 7, db: AsyncSession = Depends(get_db)):
-    since = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 90)))
+async def trace_stats(
+    days: int = 7,
+    admin: AdminIdentity = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    since = datetime.utcnow() - timedelta(days=max(1, min(days, 90)))
+    tenant = AgentTrace.tenant_id == admin.tenant_id
     total = (
         await db.execute(
-            select(func.count()).select_from(AgentTrace).where(AgentTrace.created_at >= since)
+            select(func.count()).select_from(AgentTrace)
+            .where(AgentTrace.created_at >= since, tenant)
         )
     ).scalar() or 0
     errors = (
         await db.execute(
             select(func.count())
             .select_from(AgentTrace)
-            .where(AgentTrace.created_at >= since, AgentTrace.status.in_(("error", "timeout")))
+            .where(
+                AgentTrace.created_at >= since,
+                AgentTrace.status.in_(("error", "timeout")),
+                tenant,
+            )
         )
     ).scalar() or 0
     blocked = (
         await db.execute(
             select(func.count())
             .select_from(AgentTrace)
-            .where(AgentTrace.created_at >= since, AgentTrace.status == "blocked")
+            .where(
+                AgentTrace.created_at >= since,
+                AgentTrace.status == "blocked",
+                tenant,
+            )
         )
     ).scalar() or 0
     agg = (
@@ -192,7 +220,7 @@ async def trace_stats(days: int = 7, db: AsyncSession = Depends(get_db)):
                 func.sum(AgentTrace.total_tokens),
                 func.avg(AgentTrace.tool_calls),
                 func.avg(AgentTrace.retrieval_count),
-            ).where(AgentTrace.created_at >= since)
+            ).where(AgentTrace.created_at >= since, tenant)
         )
     ).one()
 
@@ -204,21 +232,21 @@ async def trace_stats(days: int = 7, db: AsyncSession = Depends(get_db)):
                 func.avg(AgentTrace.latency_ms),
                 func.sum(AgentTrace.total_tokens),
             )
-            .where(AgentTrace.created_at >= since)
+            .where(AgentTrace.created_at >= since, tenant)
             .group_by(AgentTrace.agent_name)
         )
     ).all()
     by_model = (
         await db.execute(
             select(AgentTrace.model_name, func.count(), func.sum(AgentTrace.total_tokens))
-            .where(AgentTrace.created_at >= since, AgentTrace.model_name != "")
+            .where(AgentTrace.created_at >= since, AgentTrace.model_name != "", tenant)
             .group_by(AgentTrace.model_name)
         )
     ).all()
     safety = (
         await db.execute(
             select(AgentTrace.safety_level, func.count())
-            .where(AgentTrace.created_at >= since)
+            .where(AgentTrace.created_at >= since, tenant)
             .group_by(AgentTrace.safety_level)
         )
     ).all()

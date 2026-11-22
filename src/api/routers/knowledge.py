@@ -103,8 +103,12 @@ async def upload_document(
             doc_type=doc_type,
             category=category,
             embedding_model=get_embeddings(),
-            milvus_client=get_milvus_client(),
+            # 同步建连会阻塞 event loop（Milvus 不可用时尤其明显），放进线程池
+            milvus_client=await to_thread(get_milvus_client),
         )
+        # 新增 chunk 后 BM25 索引已过期，下一次检索强制重建（否则新文档搜不到）
+        from src.knowledge.bm25_store import invalidate as invalidate_bm25
+        invalidate_bm25()
         return {"message": f"文档 '{filename}' 导入成功", "chunks": chunk_count}
     finally:
         await to_thread(os.unlink, tmp_path)
@@ -137,13 +141,17 @@ async def delete_document(doc_name: str, admin=Depends(get_current_admin)):
     """按文档名删除知识库中的所有分块。"""
     import hashlib
     doc_id = hashlib.md5(doc_name.encode()).hexdigest()[:16]
-    milvus_client = get_milvus_client()
+    # 与 list_documents 一致：同步建连放进线程池，避免阻塞事件循环
+    milvus_client = await to_thread(get_milvus_client)
     try:
         await to_thread(
             milvus_client.delete,
             collection_name=COLLECTION_NAME,
             filter=f'doc_id == "{doc_id}"',
         )
+        # 删掉的 chunk 不能继续留在 BM25 索引里被召回
+        from src.knowledge.bm25_store import invalidate as invalidate_bm25
+        invalidate_bm25()
         return {"message": f"文档 '{doc_name}' 已删除"}
     except Exception as e:
         logger.exception("知识库文档删除失败")
@@ -153,7 +161,9 @@ async def delete_document(doc_name: str, admin=Depends(get_current_admin)):
 @router.get("/docs", response_model=DocumentListResponse, dependencies=[Depends(get_current_admin)])
 async def list_documents():
     """列出知识库中所有文档（按 doc_id 去重）。"""
-    milvus_client = get_milvus_client()
+    # get_milvus_client 是同步函数，第一次调用会创建客户端并尝试连接，
+    # 必须放到线程池里，否则会阻塞事件循环导致整个服务卡死
+    milvus_client = await to_thread(get_milvus_client)
     try:
         await to_thread(ensure_knowledge_collection, milvus_client)
         results = await to_thread(

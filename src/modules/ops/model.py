@@ -8,10 +8,10 @@
 from sqlalchemy import String, Integer, Boolean, Index
 from sqlalchemy.orm import Mapped, mapped_column
 
-from src.core.base_model import BaseModel
+from src.core.base_model import BaseModel, TenantMixin
 
 
-class TokenUsage(BaseModel):
+class TokenUsage(BaseModel, TenantMixin):
     __tablename__ = "token_usage"
 
     user_id: Mapped[str | None] = mapped_column(String(100), comment="用户 ID", nullable=True)
@@ -34,6 +34,7 @@ class TokenUsage(BaseModel):
         Index("ix_token_usage_worker", "worker"),
         # 统计接口按时间过滤 + 按天分组
         Index("ix_token_usage_created_at", "created_at"),
+        Index("ix_token_usage_tenant", "tenant_id"),
     )
 
 

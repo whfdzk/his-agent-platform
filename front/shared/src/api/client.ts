@@ -22,6 +22,12 @@ interface RequestOptions {
   signal?: AbortSignal;
   /** 超时毫秒数，默认 15s：后端挂起时不能让前端永久转圈 */
   timeoutMs?: number;
+  /**
+   * 403 时是否清登录态，默认 true（401 一律清）。
+   * 医护端要把 403 当作业务拒绝（"该患者不在你的责任范围内"），
+   * 若沿用"403 就登出"的默认，医生代批一次范围外患者就会被踢出登录。
+   */
+  authResetOn403?: boolean;
 }
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
@@ -31,6 +37,8 @@ const USER_KEY = 'his_user';
 /** 管理端用独立 key：同一浏览器同时开着患者端时不互相顶掉 */
 export const ADMIN_TOKEN_KEY = 'his_admin_token';
 export const ADMIN_USER_KEY = 'his_admin_user';
+/** 管理端当前工作租户：切换后所有请求带 X-Tenant-Code */
+export const ADMIN_TENANT_KEY = 'his_admin_tenant';
 
 /** 本地存储可能不可用（隐私模式 / 被策略禁用），清理不能因此抛错 */
 function safeRemove(key: string): void {
@@ -51,6 +59,7 @@ export function clearPatientSession(): void {
 export function clearAdminSession(): void {
   safeRemove(ADMIN_TOKEN_KEY);
   safeRemove(ADMIN_USER_KEY);
+  safeRemove(ADMIN_TENANT_KEY);
 }
 
 /** 清空两端登录态：token 失效（401）时使用，避免同浏览器另一端拿着废凭证 */
@@ -71,6 +80,20 @@ let tokenReader: () => string | undefined = () => localStorage.getItem(TOKEN_KEY
 
 export function setTokenReader(fn: () => string | undefined): void {
   tokenReader = fn;
+}
+
+/**
+ * 覆盖取租户的来源。后端 get_current_admin 用 X-Tenant-Code 决定工作租户，
+ * 缺省时回落到 token 里的 tid（管理员账号默认租户）。
+ */
+let tenantReader: () => string | undefined = () => undefined;
+
+export function setTenantReader(fn: () => string | undefined): void {
+  tenantReader = fn;
+}
+
+export function getStoredTenant(): string | undefined {
+  return localStorage.getItem(ADMIN_TENANT_KEY) || undefined;
 }
 
 /**
@@ -96,7 +119,7 @@ async function readErrorDetail(resp: Response): Promise<string> {
 }
 
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { method = 'GET', body, params, headers, keepalive, signal, timeoutMs } = options;
+  const { method = 'GET', body, params, headers, keepalive, signal, timeoutMs, authResetOn403 } = options;
 
   const url = new URL(BASE + path, window.location.origin);
   if (params) {
@@ -106,6 +129,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   }
 
   const token = tokenReader();
+  const tenant = tenantReader();
   const timeout = timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
@@ -121,6 +145,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
       headers: {
         ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(tenant ? { 'X-Tenant-Code': tenant } : {}),
         ...headers,
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -141,8 +166,9 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   if (!resp.ok) {
     const detail = await readErrorDetail(resp);
     // 401=凭证失效，403=权限被收回（如管理员被停用）：两者都必须清态，
-    // 否则页面会停留在"看起来已登录但所有数据为空"的假登录状态
-    if (resp.status === 401 || resp.status === 403) handleUnauthorized();
+    // 否则页面会停留在"看起来已登录但所有数据为空"的假登录状态。
+    // 医护端等把 403 当业务拒绝的场景可显式传 authResetOn403: false。
+    if (resp.status === 401 || (resp.status === 403 && authResetOn403 !== false)) handleUnauthorized();
     throw new ApiError(resp.status, detail);
   }
 
@@ -157,9 +183,13 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
  */
 export async function uploadForm<T>(path: string, form: FormData): Promise<T> {
   const token = tokenReader();
+  const tenant = tenantReader();
   const resp = await fetch(BASE + path, {
     method: 'POST',
-    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(tenant ? { 'X-Tenant-Code': tenant } : {}),
+    },
     body: form,
   });
   if (!resp.ok) {

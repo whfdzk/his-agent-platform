@@ -25,6 +25,22 @@ DEFAULT_TEMPERATURE = 0.7
 # 超出通常意味着调度异常（而不是业务需要）
 DEFAULT_MAX_TURNS = 8
 
+# 摘要模型的提示词：库自带的英文模板会输出 "## SESSION INTENT / SUMMARY / ARTIFACTS"
+# 这种内部标题，一旦混进用户可见的流里就非常突兀，所以改成中文且只输出正文。
+# 注意必须保留 {messages} 占位符——中间件会用它做 .format()。
+SUMMARY_PROMPT_ZH = """你是会话压缩助手。下面是一段医疗问诊对话，请提取后续仍然有用的信息，用于替换完整历史。
+
+只输出中文摘要正文（自然段落，不要 Markdown 标题，不要分节符号，不要英文小标题），需要包含：
+1. 用户的诉求与主诉症状
+2. 已确认、已否认的症状
+3. 已经给过的结论、科室、检查、预约信息
+4. 尚未完成的事项
+
+<messages>
+{messages}
+</messages>
+"""
+
 
 def llm_for(
     cfg: AgentRuntimeConfig,
@@ -63,13 +79,22 @@ def summarization_middleware(
     settings = cfg.summarization
     if not settings.enabled:
         return None
+    # 摘要模型单独打 tag：这个中间件是用 model.invoke() 跑一段提示词来生成摘要，
+    # 该调用的输出同样是 AIMessage，会被 stream_mode="messages" 当成助手回复推给前端
+    # （实测用户看到"## SESSION INTENT / SUMMARY / ARTIFACTS"这段内部模板）。
+    # 打上 tag 后流式接口可按 tag 剔除，只推送真正的回复。
+    summary_model = llm_for(cfg, default_model=default_model).with_config(tags=["summarization"])
+    # keep 必须小于 trigger，否则压缩不减少消息、每轮都会白跑一次摘要模型
+    trigger_messages = max(settings.trigger_messages, 4)
+    keep_messages = min(settings.keep_messages, max(2, trigger_messages - 2))
     return SummarizationMiddleware(
-        model=llm_for(cfg, default_model=default_model),
+        model=summary_model,
         trigger=[
             ("tokens", settings.trigger_tokens),
-            ("messages", settings.trigger_messages),
+            ("messages", trigger_messages),
         ],
-        keep=("messages", settings.keep_messages),
+        keep=("messages", keep_messages),
+        summary_prompt=SUMMARY_PROMPT_ZH,
     )
 
 
@@ -80,10 +105,17 @@ def build_worker_agent(
     default_tools: list[Any],
     default_temperature: float = DEFAULT_TEMPERATURE,
     default_model: str | None = None,
+    prompt_suffix: str = "",
 ) -> Any:
-    """装配一个 worker Agent（无 checkpointer / 无长期记忆，由调用方按需组合）。"""
+    """装配一个 worker Agent（无 checkpointer / 无长期记忆，由调用方按需组合）。
+
+    prompt_suffix：追加在提示词末尾的运行时片段（如"今天是哪天"），
+    不参与 cfg 比较，因此不影响提示词来源日志。
+    """
     tools = resolve_tools(cfg.tool_ids, fallback=default_tools)
     system_prompt = cfg.system_prompt or default_prompt
+    if prompt_suffix:
+        system_prompt = f"{system_prompt}\n\n{prompt_suffix}"
     agent = create_agent(
         model=llm_for(cfg, default_temperature=default_temperature, default_model=default_model),
         tools=tools,

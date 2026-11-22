@@ -13,10 +13,13 @@ from src.tools.patient_tools import get_my_profile
 from src.infra.embedding import get_embeddings
 from src.infra.milvus_client import aget_milvus_client_alias
 from src.infra.milvus_store import MilvusStore
+from src.agents.memory_middleware import LongTermMemoryMiddleware
 from src.infra.redis_cache import get_checkpointer_redis
 from src.agents.builder import apply_max_turns, llm_for, summarization_middleware
 from src.agents.tool_registry import resolve_tools, resolve_worker_tools
 from src.agents.worker_tools import WORKER_TOOLS
+from src.modules.handoff.middleware import HandoffInterruptMiddleware
+from src.tools.handoff_tools import HANDOFF_TOOL_NAME, request_human_handoff
 from src.core.agent_registry import AgentRuntimeConfig, get_active_config
 from src.core.context import UserContext
 
@@ -73,6 +76,18 @@ SUPERVISOR_SYSTEM_PROMPT = """你是医疗平台的智能总助手。
 - search_memory：在调用专项助手前，先检索用户的历史记忆（过敏史、既往病史、用药偏好等），将相关信息附加到调用参数中，避免重复询问用户
 - save_memory：当用户提到重要的个人健康信息时（过敏史、慢性病、长期用药等），主动保存到长期记忆
 - get_my_profile：查询当前登录患者的个人档案（姓名、性别、年龄、血型、过敏史、既往病史、脱敏联系方式）
+
+## 转人工（request_human_handoff）
+
+出现下列情况必须调用 request_human_handoff，把对话交给真人坐席，不要自己假装"已转接"：
+1. 患者明确要求：说"转人工""找真人""人工客服""有没有人看看""我要投诉"；
+2. 同一个问题你已经给过建议，患者再次表示"没解决/还是不行/你说的没用"；
+3. 需要人工确认才敢执行的事：具体处方或剂量调整、退费、纠纷、需要查阅线下资料的追问；
+4. 患者情绪明显激动，或反复表达不信任。
+
+调用时 summary 用一句话写患者的诉求，不要贴整段对话。调用后本轮会被挂起直到坐席处理，
+坐席回复后你会收到坐席原话：此时只用 1-2 句话确认患者已看到并提出后续建议，
+不要复述坐席原话，也不要再说"我帮您转接"。
 
 ## 身份类问题（"我是谁"、"我的资料/我的病历"、"我对什么过敏"）
 
@@ -184,26 +199,41 @@ async def _build_supervisor(cfg: AgentRuntimeConfig):
     # model 显式传入 ChatOpenAI 实例（不是模型名字符串）：
     # - api_key / base_url 由配置（model_configs 或 .env）显式控制，不靠隐式推断
     # - 温度调低：意图路由要稳定、可复现，不适合高温度发散
+    # 默认模型跟随 .env 的 CHAT_MODEL（当前网关是 DashScope + qwen-max）。
+    # 此前用的是 DEEPSEEK_MODEL，agent 配置里 model 为空时会请求 deepseek-chat，
+    # 打到通义网关必然 404（模型不存在），整轮对话直接降级成"服务暂时不可用"。
     llm = llm_for(
-        cfg, default_temperature=_DEFAULT_TEMPERATURE, default_model=settings.DEEPSEEK_MODEL,
+        cfg, default_temperature=_DEFAULT_TEMPERATURE, default_model=settings.CHAT_MODEL,
     )
 
+    # 转人工工具常驻：不依赖管理端在工具清单里勾选它。
+    # 它是"患者喊人工"的唯一落单入口，漏配等于这个能力直接消失。
+    tools = memory_tools + worker_tools
+    if HANDOFF_TOOL_NAME not in {getattr(t, "name", "") for t in tools}:
+        tools = tools + [request_human_handoff]
+
     middleware = []
-    summarization = summarization_middleware(cfg, default_model=settings.DEEPSEEK_MODEL)
+    # 转人工挂起：模型调用 request_human_handoff 时建单并 interrupt()，
+    # 坐席处理完由 Command(resume=...) 续跑（见 modules/handoff/middleware.py）
+    middleware.append(HandoffInterruptMiddleware())
+    summarization = summarization_middleware(cfg, default_model=settings.CHAT_MODEL)
     if summarization is not None:  # 会话总结压缩
         middleware.append(summarization)
+    # 长期记忆自动注入：prompt 里虽写了"调专项助手前先 search_memory"，
+    # 但真实链路里模型从不执行（日志：保存 2 次 / 搜索 0 次），改为代码强制注入
+    middleware.append(LongTermMemoryMiddleware(store))
 
     agent = create_agent(
         model=llm,
-        tools=memory_tools + worker_tools,
+        tools=tools,
         system_prompt=cfg.system_prompt or SUPERVISOR_SYSTEM_PROMPT,
         middleware=middleware,
         checkpointer=checkpointer,  # 短期记忆. agent chat ui（禁用你配置 checkpointer）
         store=store  # 长期记忆. 把同一个用户，任意会话的有价值信息进行存储。
     )
     logger.info(
-        f"supervisor 已装配：工具 {len(memory_tools)} 个 + 子 Agent {len(worker_tools)} 个，"
-        f"提示词来源 {'数据库' if cfg.system_prompt else '代码内置'}，"
+        f"supervisor 已装配：工具 {len(memory_tools)} 个 + 子 Agent {len(worker_tools)} 个"
+        f"（含转人工），提示词来源 {'数据库' if cfg.system_prompt else '代码内置'}，"
         f"会话压缩 {'开启' if summarization else '关闭'}"
     )
     return apply_max_turns(agent, cfg)

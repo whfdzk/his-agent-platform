@@ -20,7 +20,7 @@ from loguru import logger
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import get_current_user_id
+from src.api.deps import get_current_user_id, require_scope
 from src.core.config import get_settings
 from src.core.concurrency import to_thread
 from src.core.exceptions import BizErrorCode, BizException
@@ -62,7 +62,7 @@ from src.modules.patient.service import (
 router = APIRouter(
     prefix="/api/v1/patient",
     tags=["patient"],
-    dependencies=[Depends(get_current_user_id)],
+    dependencies=[Depends(get_current_user_id), Depends(require_scope("patient:read"))],
 )
 
 settings = get_settings()

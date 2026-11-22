@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import get_current_user_id
+from src.api.deps import AuthContext, get_current_user_id, require_auth, require_scope
 from src.infra.database import get_db
 from src.modules.medical.model import Appointment
 
@@ -29,7 +29,7 @@ from src.modules.medical.model import Appointment
 router = APIRouter(
     prefix="/api/v1/appointments",
     tags=["appointments"],
-    dependencies=[Depends(get_current_user_id)],
+    dependencies=[Depends(get_current_user_id), Depends(require_scope("appointment:read"))],
 )
 
 
@@ -50,6 +50,7 @@ def _serialize(a: Appointment, *, include_diagnosis: bool = True) -> dict:
         "session_id": a.session_id,
         "appointment_no": a.appointment_no,
         "doctor_name": a.doctor_name,
+        "doctor_clinician_id": a.doctor_clinician_id,
         "department": a.department,
         "date": a.date,
         "time_slot": a.time_slot,
@@ -69,6 +70,8 @@ class AppointmentCreate(BaseModel):
     session_id: str = ""
     department: str
     doctor_name: str = ""
+    # 前端从 /doctors 目录里选中的医生账号；不传则后端按(科室, 姓名)唯一匹配补
+    doctor_clinician_id: int = 0
     date: str = ""
     time_slot: str = ""
     fee: float = 0
@@ -79,27 +82,50 @@ class AppointmentCreate(BaseModel):
 @router.post("")
 async def create_appointment(
     req: AppointmentCreate,
-    current_user: str = Depends(get_current_user_id),
+    ctx: AuthContext = Depends(require_auth()),
     db: AsyncSession = Depends(get_db),
 ):
-    """直接创建一条挂号预约（前端确认 Modal 调用）。"""
-    patient_id = _patient_id(current_user)
+    """直接创建一条挂号预约（前端确认 Modal 调用）。
 
-    appt = Appointment(
+    B2 收口：不再直接插 confirmed 行，而是「建草稿 → 立即批准」。
+    手动下单与对话下单走同一条状态机，落库、审计、幂等口径一致；
+    也因此这条路径不会再出现"绕过确认门控直接写死预约"的情况。
+    """
+    from src.modules.clinical import actions as clinical
+    from src.modules.clinical.decide import approve_action
+    from src.modules.clinical.model import ACTION_APPOINTMENT, SOURCE_CLINICIAN
+
+    patient_id = _patient_id(ctx.subject_id)
+    current_user = ctx.subject_id
+
+    row = await clinical.create_action(
+        db,
+        action_type=ACTION_APPOINTMENT,
+        payload={
+            "department": req.department,
+            "doctor_name": req.doctor_name,
+            "doctor_clinician_id": req.doctor_clinician_id or None,
+            "date": req.date,
+            "time_slot": req.time_slot,
+            "fee": req.fee,
+            "queue_number": req.queue_number,
+            "diagnosis": req.diagnosis,
+        },
+        summary=f"{req.department}｜{req.date} {req.time_slot}".strip("｜ "),
         patient_id=patient_id,
-        session_id=req.session_id or None,
-        appointment_no=f"APT{uuid.uuid4().hex[:8].upper()}",
-        doctor_name=req.doctor_name,
-        department=req.department,
-        date=req.date,
-        time_slot=req.time_slot,
-        fee=req.fee,
-        queue_number=req.queue_number,
-        status="confirmed",
-        diagnosis=req.diagnosis or None,
+        user_id=current_user,
+        session_id=req.session_id,
+        thread_id=f"{current_user}:{req.session_id}",
+        source=SOURCE_CLINICIAN,
+        requested_by="api:appointment_create",
+        tenant_id=ctx.tenant_id,
     )
-    db.add(appt)
-    await db.flush()
+    # 走 decide 统一收口（而不是直接 clinical.approve）：接诊建关系等后置动作只实现一处
+    _executed, data = await approve_action(
+        db, row.id, actor=f"patient:{current_user}",
+    )
+
+    appt = await db.get(Appointment, data["appointment_id"])
     return {"message": "预约成功", "appointment": _serialize(appt)}
 
 
@@ -109,15 +135,18 @@ async def list_appointments(
     end_date: str | None = None,
     status: str | None = None,
     limit: int = 100,
-    current_user: str = Depends(get_current_user_id),
+    ctx: AuthContext = Depends(require_auth()),
     db: AsyncSession = Depends(get_db),
 ):
     """查询本人预约列表，按日期倒序。"""
-    patient_id = _patient_id(current_user)
+    patient_id = _patient_id(ctx.subject_id)
     # limit 上限收敛：避免一次拉全表
     limit = max(1, min(limit, 200))
 
-    q = select(Appointment).where(Appointment.patient_id == patient_id)
+    q = select(Appointment).where(
+        Appointment.patient_id == patient_id,
+        Appointment.tenant_id == ctx.tenant_id,
+    )
     if start_date:
         q = q.where(Appointment.date >= start_date)
     if end_date:
@@ -132,10 +161,47 @@ async def list_appointments(
     return {"appointments": [_serialize(a) for a in rows], "total": total}
 
 
-async def _load_own(db: AsyncSession, appointment_id: int, patient_id: int) -> Appointment:
-    """按 (id, patient_id) 取预约：他人预约返回 404 而不是 403，避免探测 ID 是否存在。"""
+@router.get("/doctors")
+async def list_doctors(
+    department_id: int | None = None,
+    ctx: AuthContext = Depends(require_auth()),
+    db: AsyncSession = Depends(get_db),
+):
+    """可挂号医生目录（患者端选医生用）。
+
+    与 /api/v1/admin/clinicians/directory 共用同一个取数函数：
+    两边各写一份"谁在岗"，迟早出现管理端看得到、患者端选不到。
+    不返回工号与手机号 —— 挂号不需要这些。
+    """
+    from src.modules.clinician.profile import list_directory
+
+    items = await list_directory(db, department_id=department_id, tenant_id=ctx.tenant_id)
+    return {
+        "doctors": [
+            {
+                "clinician_id": d["clinician_id"],
+                "name": d["name"],
+                "title": d["title"],
+                "specialty": d["specialty"],
+                "intro": d["intro"],
+                "departments": d["departments"],
+            }
+            for d in items
+        ],
+        "total": len(items),
+    }
+
+
+async def _load_own(
+    db: AsyncSession, appointment_id: int, patient_id: int, tenant_id: int,
+) -> Appointment:
+    """按 (id, patient_id, tenant_id) 取预约：他人或他租户预约返回 404，避免探测 ID 是否存在。"""
     appt = await db.get(Appointment, appointment_id)
-    if appt is None or appt.patient_id != patient_id:
+    if (
+        appt is None
+        or appt.patient_id != patient_id
+        or int(appt.tenant_id or 1) != int(tenant_id)
+    ):
         raise BizException(BizErrorCode.NOT_FOUND, "预约不存在", status_code=404)
     return appt
 
@@ -143,21 +209,21 @@ async def _load_own(db: AsyncSession, appointment_id: int, patient_id: int) -> A
 @router.get("/{appointment_id}")
 async def get_appointment(
     appointment_id: int,
-    current_user: str = Depends(get_current_user_id),
+    ctx: AuthContext = Depends(require_auth()),
     db: AsyncSession = Depends(get_db),
 ):
-    appt = await _load_own(db, appointment_id, _patient_id(current_user))
+    appt = await _load_own(db, appointment_id, _patient_id(ctx.subject_id), ctx.tenant_id)
     return {"appointment": _serialize(appt)}
 
 
 @router.patch("/{appointment_id}/cancel")
 async def cancel_appointment(
     appointment_id: int,
-    current_user: str = Depends(get_current_user_id),
+    ctx: AuthContext = Depends(require_auth()),
     db: AsyncSession = Depends(get_db),
 ):
     """取消预约（软删除：status -> cancelled）。"""
-    appt = await _load_own(db, appointment_id, _patient_id(current_user))
+    appt = await _load_own(db, appointment_id, _patient_id(ctx.subject_id), ctx.tenant_id)
     if appt.status == "cancelled":
         return {"message": "预约已取消", "appointment": _serialize(appt)}
     appt.status = "cancelled"

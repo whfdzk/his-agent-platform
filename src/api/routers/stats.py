@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select, func, cast, Date
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import get_current_admin
+from src.api.deps import AdminIdentity, get_current_admin
 from src.infra.database import AsyncSessionLocal, get_db
 from src.modules.medical.model import Consultation, Department
 from src.modules.ops.model import TokenUsage
@@ -52,6 +52,7 @@ async def token_stats(
     session_id: str | None = None,
     user_id: str | None = None,
     limit: int = 100,
+    admin: AdminIdentity = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -64,12 +65,14 @@ async def token_stats(
     """
     if group_by == "model":
         group_col = TokenUsage.model
+        key_expr = func.coalesce(group_col, "unknown").label("key")
     elif group_by == "worker":
         group_col = TokenUsage.worker
+        key_expr = func.coalesce(group_col, "unknown").label("key")
     else:
+        # 按天分组时，Date 类型不能和字符串 coalesce，直接用 date
         group_col = cast(TokenUsage.created_at, Date)
-
-    key_expr = func.coalesce(group_col, "unknown").label("key")
+        key_expr = group_col.label("key")
     q = select(
         key_expr,
         func.count().label("calls"),
@@ -77,7 +80,7 @@ async def token_stats(
         func.coalesce(func.sum(TokenUsage.completion_tokens), 0).label("completion_tokens"),
         func.coalesce(func.sum(TokenUsage.total_tokens), 0).label("total_tokens"),
         func.coalesce(func.sum(TokenUsage.latency_ms), 0).label("latency_ms"),
-    )
+    ).where(TokenUsage.tenant_id == admin.tenant_id)
 
     start_at = _parse_moment(start)
     if start_at:
@@ -119,6 +122,7 @@ async def list_traces(
     worker: str | None = None,
     limit: int = 50,
     offset: int = 0,
+    admin: AdminIdentity = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -127,6 +131,7 @@ async def list_traces(
     """
     q = (
         select(TokenUsage)
+        .where(TokenUsage.tenant_id == admin.tenant_id)
         .order_by(TokenUsage.created_at.desc(), TokenUsage.id.desc())
         .limit(TRACE_SCAN_LIMIT)
     )
@@ -167,7 +172,7 @@ async def list_traces(
     return {"traces": all_traces[offset:offset + limit], "total": len(all_traces)}
 
 
-async def _consultation_breakdowns(since: datetime) -> tuple[list, list, list]:
+async def _consultation_breakdowns(since: datetime, tenant_id: int) -> tuple[list, list, list]:
     """按日 / 科室 / 紧急程度三条聚合并发执行。
 
     AsyncSession 不支持并发操作，必须一条查询一个 session，
@@ -180,7 +185,10 @@ async def _consultation_breakdowns(since: datetime) -> tuple[list, list, list]:
                     cast(Consultation.created_at, Date).label("day"),
                     func.count().label("cnt"),
                 )
-                .where(Consultation.created_at >= since)
+                .where(
+                    Consultation.created_at >= since,
+                    Consultation.tenant_id == tenant_id,
+                )
                 .group_by("day")
                 .order_by("day")
             )).all()
@@ -192,8 +200,12 @@ async def _consultation_breakdowns(since: datetime) -> tuple[list, list, list]:
                     func.coalesce(Department.name, "未知").label("name"),
                     func.count().label("cnt"),
                 )
+                .select_from(Consultation)
                 .outerjoin(Department, Consultation.department_id == Department.id)
-                .where(Consultation.created_at >= since)
+                .where(
+                    Consultation.created_at >= since,
+                    Consultation.tenant_id == tenant_id,
+                )
                 .group_by("name")
                 .order_by(func.count().desc())
             )).all()
@@ -202,7 +214,10 @@ async def _consultation_breakdowns(since: datetime) -> tuple[list, list, list]:
         async with AsyncSessionLocal() as db:
             return (await db.execute(
                 select(Consultation.urgency_level, func.count())
-                .where(Consultation.created_at >= since)
+                .where(
+                    Consultation.created_at >= since,
+                    Consultation.tenant_id == tenant_id,
+                )
                 .group_by(Consultation.urgency_level)
             )).all()
 
@@ -210,13 +225,16 @@ async def _consultation_breakdowns(since: datetime) -> tuple[list, list, list]:
 
 
 @router.get("/api/v1/stats/consultations")
-async def consultation_stats(days: int = 30):
+async def consultation_stats(
+    days: int = 30,
+    admin: AdminIdentity = Depends(get_current_admin),
+):
     """问诊统计：按日问诊量 / 科室分布 / 紧急程度分布。
 
     三条聚合各自开一个 session 并发执行，因此不需要再占用注入进来的会话。
     """
     since = datetime.now() - timedelta(days=days)
-    day_rows, dept_rows, urgency_rows = await _consultation_breakdowns(since)
+    day_rows, dept_rows, urgency_rows = await _consultation_breakdowns(since, admin.tenant_id)
 
     return {
         "days": days,
@@ -227,14 +245,21 @@ async def consultation_stats(days: int = 30):
 
 
 @router.get("/api/v1/stats/symptoms")
-async def symptom_stats(top: int = 10, db: AsyncSession = Depends(get_db)):
+async def symptom_stats(
+    top: int = 10,
+    admin: AdminIdentity = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
     """
     症状 TopN：从问诊主诉（chief_complaint）按顿号/逗号切分后计数。
     注意：简单文本切分，非严格医学实体识别，仅供看板参考。
     """
     rows = (await db.execute(
         select(Consultation.chief_complaint)
-        .where(Consultation.chief_complaint.isnot(None))
+        .where(
+            Consultation.chief_complaint.isnot(None),
+            Consultation.tenant_id == admin.tenant_id,
+        )
         .order_by(Consultation.created_at.desc())
         .limit(SYMPTOM_SCAN_LIMIT)
     )).scalars().all()

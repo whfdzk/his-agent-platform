@@ -18,6 +18,7 @@ from typing import Any
 from loguru import logger
 
 from src.core.config import get_llm
+from src.core.concurrency import to_thread
 from src.modules.patient.service import LEVEL_LABELS, METRIC_META, metric_label
 
 DISCLAIMER = "以上仅为健康管理提示，不能替代医生诊断；如有不适请及时就医。"
@@ -186,11 +187,13 @@ async def retrieve_docs(question: str) -> list[dict]:
         from src.infra.milvus_client import get_milvus_client
         from src.knowledge.doc_rag import search_docs_raw
 
+        # 同步建连放进线程池：否则 Milvus 不可用时会阻塞整个事件循环
+        milvus_client = await to_thread(get_milvus_client)
         hits = await asyncio.wait_for(
             search_docs_raw(
                 question,
                 embedding_model=get_embeddings(),
-                milvus_client=get_milvus_client(),
+                milvus_client=milvus_client,
                 top_k=RETRIEVAL_TOP_K,
                 rerank_top_k=RERANK_TOP_K,
                 use_hyde=False,

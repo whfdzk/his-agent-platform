@@ -104,3 +104,84 @@ async def ocr_image(content: bytes, filename: str) -> str:
     if text:
         logger.info(f"VL OCR 识别成功: {len(text)} 字符")
     return text
+
+
+# ── 聊天图片问答：把患者上传的图片理解成文字 ─────────────────────────────
+#
+# 与 ocr_image 的分工：
+#   ocr_image：报告录入链路，要求"逐行转录"，下游靠行结构提取指标；
+#   describe_medical_image：聊天链路，图片类型不限（报告单/药盒/皮疹/伤口），
+#   要的是"能喂给纯文本 Agent 的可读描述"，所以要按类型分别描述重点。
+#
+# 为什么不直接把图片塞给主模型：项目主干 Agent 绑的是纯文本 chat 模型
+# （DeepSeek 一类不支持 image 输入）。先转文字再进对话，既不用换模型、
+# 也不用改 Agent 装配，且图片内容会作为普通文本参与后续检索与安全审核。
+#
+# 隐私：图片只在内存中转 base64，不落库、不进日志；失败只记异常摘要。
+
+_QA_PROMPT = (
+    "你在辅助一个医疗问诊系统理解患者上传的图片。请客观描述图中与健康相关的内容，"
+    "供接诊医生助理参考：\n"
+    "1. 先说明这是什么图（检查/检验报告单、药品包装或说明书、皮肤或伤口照片、其他）；\n"
+    "2. 报告单或说明书：逐项列出可见的项目名、数值、单位、参考区间；\n"
+    "3. 皮肤或伤口：描述部位、形态、颜色、范围等可见特征；\n"
+    "4. 只描述看到的，不要推测图片以外的信息，不要给诊断结论或用药建议；\n"
+    "5. 中文条目式输出，控制在 200 字以内。"
+)
+
+
+def _decode_image_payload(payload: str) -> bytes:
+    """接受 data URL 或裸 base64 两种入参，统一解成原始字节。"""
+    raw = (payload or "").strip()
+    if raw.startswith("data:"):
+        comma = raw.find(",")
+        if comma < 0:
+            raise ValueError("data URL 缺少逗号分隔符")
+        raw = raw[comma + 1:]
+    return base64.b64decode(raw, validate=False)
+
+
+async def describe_medical_image(payload: str, filename: str = "", question: str = "") -> str:
+    """把患者随消息上传的图片转成文字描述；不可用或失败一律返回空串（不阻断对话）。"""
+    settings = get_settings()
+    if not settings.IMAGE_QA_ENABLED or not payload:
+        return ""
+
+    try:
+        content = _decode_image_payload(payload)
+    except Exception as e:
+        logger.warning(f"图片解码失败，跳过图片理解: {type(e).__name__}: {str(e)[:100]}")
+        return ""
+    if len(content) > settings.IMAGE_QA_MAX_BYTES:
+        logger.warning(f"图片过大（{len(content)} 字节），跳过图片理解")
+        return ""
+
+    try:
+        jpeg = await to_thread(_to_jpeg, content, settings.VL_OCR_MAX_SIDE)
+    except Exception as e:
+        logger.warning(f"图片预处理失败，跳过图片理解: {type(e).__name__}: {str(e)[:100]}")
+        return ""
+
+    prompt = _QA_PROMPT
+    if question.strip():
+        prompt += f"\n患者随图提出的是：{question.strip()[:200]}"
+
+    data_uri = f"data:image/jpeg;base64,{base64.b64encode(jpeg).decode()}"
+    message = HumanMessage(
+        content=[
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": data_uri}},
+        ]
+    )
+    try:
+        result = await guarded(
+            get_vl_llm().ainvoke([message]), timeout=settings.IMAGE_QA_TIMEOUT
+        )
+    except Exception as e:
+        logger.warning(f"图片理解不可用，跳过: {type(e).__name__}: {str(e)[:100]}")
+        return ""
+
+    text = _flatten_content(getattr(result, "content", "")).strip()
+    if text:
+        logger.info(f"图片理解成功: {len(text)} 字符（来源 {filename or '未命名'}）")
+    return text[:800]

@@ -10,13 +10,11 @@ import asyncio
 import sys
 import os
 
-from llama_cloud import OpenAiEmbedding
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from pymilvus import MilvusClient
 from src.core.config import get_settings
-from src.infra.milvus_client import get_milvus_client_alias
+from src.infra.embedding import get_embeddings
 from src.infra.database import AsyncSessionLocal
 
 settings = get_settings()
@@ -25,15 +23,11 @@ settings = get_settings()
 async def main():
     print("[INFO] 初始化知识文档索引...")
 
-    get_milvus_client_alias()
     milvus_client = MilvusClient(
         uri=f"http://{settings.MILVUS_HOST}:{settings.MILVUS_PORT}"
     )
-    embedding_model = OpenAiEmbedding(
-        model=settings.EMBEDDING_MODEL,
-        api_key=settings.EMBEDDING_API_KEY,
-        base_url=settings.EMBEDDING_BASE_URL,
-    )
+    # 与业务链路共用同一个 Embedding 客户端工厂，避免维度/参数与检索侧不一致
+    embedding_model = get_embeddings()
 
     async with AsyncSessionLocal() as db:
         from src.knowledge.doc_ingestion import ingest_drug_instructions

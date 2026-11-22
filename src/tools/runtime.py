@@ -30,3 +30,19 @@ def resolve_patient_id(runtime: ToolRuntime) -> int | None:
     if not user_id or user_id == "anon" or not user_id.isdigit():
         return None
     return int(user_id)
+
+
+def resolve_thread_id(runtime: ToolRuntime) -> str:
+    """当前 LangGraph thread_id（形如 "{user_id}:{session_id}"），取不到返回空串。"""
+    config = getattr(runtime, "config", None) or {}
+    configurable = config.get("configurable") or {}
+    return str(configurable.get("thread_id") or "")
+
+
+def resolve_session_id(runtime: ToolRuntime) -> str:
+    """会话 ID：优先 UserContext.session_id，回退从 thread_id 拆。"""
+    ctx = getattr(runtime, "context", None)
+    if ctx is not None and getattr(ctx, "session_id", None):
+        return str(ctx.session_id)
+    thread_id = resolve_thread_id(runtime)
+    return thread_id.split(":", 1)[1] if ":" in thread_id else ""

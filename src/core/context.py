@@ -20,3 +20,6 @@ class UserContext:  # 用户上下文
     patient_id: int | None = None
     # 角色：patient=患者端（默认）；doctor/pharmacist/staff/admin 才能触达运营库（NL2SQL）
     role: str = "patient"
+    # C1 租户：工具写库（工单/临床动作/预约）必须带着它，
+    # 否则会吃列默认值落到默认租户。游客不落库，默认租户即可
+    tenant_id: int = 1

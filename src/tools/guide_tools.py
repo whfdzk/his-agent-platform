@@ -20,7 +20,13 @@ from loguru import logger
 from sqlalchemy import func, or_, select
 
 from src.core.context import UserContext
-from src.tools.runtime import GUEST_HINT, resolve_patient_id
+from src.tools.runtime import (
+    GUEST_HINT,
+    resolve_patient_id,
+    resolve_session_id,
+    resolve_thread_id,
+    resolve_user_id,
+)
 
 # 就诊准备：通用项 + 科室专项，规则化生成（可复现，也便于单测）
 _COMMON_PREPARE = [
@@ -384,6 +390,7 @@ async def manage_appointment(
     time_slot: str = "",
     appointment_id: int = 0,
     diagnosis: str = "",
+    doctor_name: str = "",
 ) -> str:
     """
     就医辅助的预约系统对接：查询、创建、取消挂号预约。
@@ -399,6 +406,9 @@ async def manage_appointment(
         time_slot       : 就诊时段，如"上午 09:00-10:00"
         appointment_id  : cancel 时的预约 ID
         diagnosis       : 关联的主诊断/症状（可空）
+        doctor_name     : 患者明确点名的医生姓名（可空）。不填时若本科室只有一位在岗医生，
+                          直接落到他名下；有多个医生则不指定，按待分配处理。
+                          不要自己编造医生姓名，只传患者说过的名字。
     """
     patient_id = resolve_patient_id(runtime)
     if patient_id is None:
@@ -417,22 +427,105 @@ async def manage_appointment(
                     return "创建预约需要提供就诊科室。"
                 if not appointment_date.strip():
                     return "创建预约需要提供就诊日期（YYYY-MM-DD）。"
-                appt = Appointment(
-                    patient_id=patient_id,
-                    appointment_no=f"APT{uuid.uuid4().hex[:8].upper()}",
-                    department=department.strip(),
-                    date=appointment_date.strip(),
-                    time_slot=time_slot.strip() or "待分配",
-                    status="confirmed",
-                    diagnosis=diagnosis.strip() or None,
+
+                # B2：这里不再直接写 confirmed 预约。
+                # 挂号一旦落库就是既成事实，而"先建好、再问患者要不要"正是此前
+                # 被投诉的问题（话术里还在问，后台已经占了号源）。
+                # 改为生成一条待确认草稿，患者确认后由 executors 真正落库。
+                from datetime import date as _date
+
+                from src.modules.clinical import actions as clinical
+                from src.modules.clinical.dates import normalize_date
+                from src.modules.clinical.link import remember_pending
+                from src.modules.clinical.model import ACTION_APPOINTMENT, SOURCE_TOOL
+
+                dept = department.strip()
+                # 日期不能让模型心算：实测「明天上午」被写成 2023-11-22。
+                # 这里用规则换算，算不出来就要求重新提供，绝不把错误日期带进库。
+                date_str, date_err = normalize_date(appointment_date)
+                if date_str is None:
+                    return (
+                        f"{date_err}。今天是 {_date.today().isoformat()}，"
+                        "请确认就诊日期后重新发起。"
+                    )
+                slot = time_slot.strip() or "待分配"
+                thread_id = resolve_thread_id(runtime)
+
+                # 医生：C4 续——挂号草稿必须落到具体医生账号上，否则确认后
+                # 医生端看不到这个患者（consulted 关系建不出来）。
+                # 规则：患者点名的医生按(科室, 姓名)唯一匹配；没点名时只有"本科室唯一在岗医生"
+                # 才允许自动指定，多于一位就留空由后端按待分配处理 —— 不猜。
+                from src.modules.clinician.profile import (
+                    department_id_of,
+                    list_directory,
+                    resolve_doctor,
                 )
-                db.add(appt)
-                await db.commit()
-                await db.refresh(appt)
+
+                dept_id = await department_id_of(db, dept)
+                dept_items = (
+                    await list_directory(db, department_id=dept_id) if dept_id else []
+                )
+
+                def _label(item: dict) -> str:
+                    return f"{item['name']} {item['title']}".strip()
+
+                wanted = doctor_name.strip()
+                doctor_id: int | None = None
+                doctor_label = ""
+                if wanted:
+                    doctor_id = await resolve_doctor(db, department=dept, doctor_name=wanted)
+                    if doctor_id is None:
+                        names = "、".join(
+                            (i["name"] + (f"（{i['title']}）" if i["title"] else ""))
+                            for i in dept_items
+                        ) or "暂无可挂号医生"
+                        return (
+                            f"本科室未找到医生「{wanted}」。{dept} 当前可选医生：{names}。\n"
+                            "请让患者从上面的名单里选择；若患者表示都可以，就不要指定医生再创建。"
+                        )
+                    hit = next(
+                        (i for i in dept_items if i["clinician_id"] == doctor_id), None,
+                    )
+                    doctor_label = _label(hit) if hit else wanted
+                elif len(dept_items) == 1:
+                    doctor_id = dept_items[0]["clinician_id"]
+                    doctor_label = _label(dept_items[0])
+
+                row = await clinical.create_action(
+                    db,
+                    action_type=ACTION_APPOINTMENT,
+                    payload={
+                        "department": dept,
+                        "doctor_name": doctor_label,
+                        "doctor_clinician_id": doctor_id,
+                        "date": date_str,
+                        "time_slot": slot,
+                        "diagnosis": (diagnosis or "").strip(),
+                        "source": "tool:appointment_manager",
+                    },
+                    summary=(
+                        f"{dept}｜{date_str} {slot}"
+                        + (f"｜{doctor_label}" if doctor_label else "")
+                    ),
+                    patient_id=patient_id,
+                    user_id=resolve_user_id(runtime),
+                    session_id=resolve_session_id(runtime),
+                    thread_id=thread_id,
+                    source=SOURCE_TOOL,
+                    requested_by="tool:appointment_manager",
+                    tenant_id=int(
+                        getattr(getattr(runtime, "context", None), "tenant_id", 1) or 1
+                    ),
+                )
+                await remember_pending(thread_id, row.id)
+
+                doctor_line = f"就诊医生：{doctor_label}\n" if doctor_label else "就诊医生：待分配\n"
                 return (
-                    f"已创建预约：{appt.department}｜{appt.date} {appt.time_slot}｜"
-                    f"预约号 {appt.appointment_no}（ID {appt.id}）。"
-                    "请提前 15-30 分钟到院，具体号源以医院挂号系统为准。"
+                    f"已生成挂号申请（参考号 {row.id}）：{dept}｜{date_str} {slot}。\n"
+                    f"{doctor_line}"
+                    "注意：此时还没有真正挂号，号源未被占用；必须由患者确认后才会落库。\n"
+                    "请向用户复述科室、日期、时段与医生，明确问一句「是否确认预约」，"
+                    "等用户确认后再告知已成功挂号。"
                 )
 
             if act == "cancel":

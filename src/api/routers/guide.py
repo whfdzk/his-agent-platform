@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import time
 from fastapi import APIRouter, Depends
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +17,30 @@ from src.infra.database import get_db
 from src.modules.medical.model import Department, Disease, Hospital
 
 router = APIRouter(prefix="/api/v1/guide", tags=["guide"])
+
+# 缓存科室疾病数量（5分钟过期）
+_disease_count_cache: dict[int, int] = {}
+_disease_count_cache_time: float = 0
+_CACHE_TTL = 300  # 5分钟
+
+
+async def get_disease_counts(db: AsyncSession) -> dict[int, int]:
+    """获取科室疾病数量（带缓存）。"""
+    global _disease_count_cache, _disease_count_cache_time
+    now = time.time()
+
+    if now - _disease_count_cache_time < _CACHE_TTL and _disease_count_cache:
+        return _disease_count_cache
+
+    _disease_count_cache = dict(
+        (
+            await db.execute(
+                select(Disease.department_id, func.count(Disease.id)).group_by(Disease.department_id)
+            )
+        ).all()
+    )
+    _disease_count_cache_time = now
+    return _disease_count_cache
 
 
 def _serialize_hospital(h: Hospital) -> dict:
@@ -48,13 +73,7 @@ async def list_departments(
         q = q.where(or_(Department.name.like(kw), Department.description.like(kw)))
     rows = (await db.execute(q.order_by(Department.id.asc()).limit(max(1, min(limit, 200))))).scalars().all()
 
-    counts = dict(
-        (
-            await db.execute(
-                select(Disease.department_id, func.count(Disease.id)).group_by(Disease.department_id)
-            )
-        ).all()
-    )
+    counts = await get_disease_counts(db)
     return {
         "departments": [
             {

@@ -14,7 +14,7 @@ from sqlalchemy import Boolean, Index, Integer, String, Text, BigInteger
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
-from src.core.base_model import BaseModel
+from src.core.base_model import BaseModel, TenantMixin
 
 # Agent 状态：draft=草稿 / published=已发布 / disabled=已停用
 AGENT_STATUS_DRAFT = "draft"
@@ -111,7 +111,7 @@ class SystemConfig(BaseModel):
 
 # ── P2 会员域 ────────────────────────────────────────────────────────
 
-class MembershipPlan(BaseModel):
+class MembershipPlan(BaseModel, TenantMixin):
     """会员套餐定义。"""
     __tablename__ = "membership_plans"
 
@@ -122,10 +122,13 @@ class MembershipPlan(BaseModel):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, comment="是否上架")
     sort_order: Mapped[int] = mapped_column(Integer, default=0, comment="展示排序，数字越小越靠前")
 
-    __table_args__ = (Index("ix_membership_plans_enabled", "enabled"),)
+    __table_args__ = (
+        Index("ix_membership_plans_enabled", "enabled"),
+        Index("ix_membership_plans_tenant", "tenant_id"),
+    )
 
 
-class MembershipOrder(BaseModel):
+class MembershipOrder(BaseModel, TenantMixin):
     """会员购买订单。本期人工/对接支付前的记录层。"""
     __tablename__ = "membership_orders"
 
@@ -142,10 +145,11 @@ class MembershipOrder(BaseModel):
         Index("uq_membership_orders_no", "order_no", unique=True),
         Index("ix_membership_orders_user", "user_id"),
         Index("ix_membership_orders_status", "status"),
+        Index("ix_membership_orders_tenant", "tenant_id"),
     )
 
 
-class UserMembership(BaseModel):
+class UserMembership(BaseModel, TenantMixin):
     """用户当前会员订阅：一个用户一条有效记录，续费顺延 expire_at。"""
     __tablename__ = "user_memberships"
 
@@ -160,4 +164,5 @@ class UserMembership(BaseModel):
 
     __table_args__ = (
         Index("uq_user_memberships_user", "user_id", unique=True),
+        Index("ix_user_memberships_tenant", "tenant_id"),
     )

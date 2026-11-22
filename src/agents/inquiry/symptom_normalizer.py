@@ -41,7 +41,9 @@ SYMPTOM_EXTRACT_PROMPT = """你是医疗术语标准化专家。
 
 用户描述：{user_input}
 
-请提取所有症状并标准化后填入 symptoms 字段。如果没有明确症状，symptoms 填空列表。"""
+请提取所有症状并标准化后填入 symptoms 字段。如果没有明确症状，symptoms 填空列表。
+
+输出必须是 JSON 对象，形如 {{"symptoms": ["发热", "头痛"]}}。"""
 
 
 async def extract_and_normalize_symptoms(

@@ -1,6 +1,7 @@
+from datetime import date
 from typing import Any
 
-from src.agents.builder import build_worker_agent, get_runtime_agent
+from src.agents.builder import build_worker_agent, get_runtime_agent, reset_agent_cache
 from src.core.agent_registry import AgentRuntimeConfig, get_active_config
 from src.tools.guide_tools import (
     get_visit_preparation,
@@ -42,6 +43,22 @@ GUIDE_SYSTEM_PROMPT = """你是平台医疗的就医辅助助手（GuideAgent）
 注意：分诊与预约为辅助信息，最终以医院现场分诊台与挂号系统为准。"""
 
 
+# 模型没有内置的"现在"，不告诉它就可能把"明天"算成训练语料里的年份
+# （实测出过 2023-11-22 这种错日期，最终会写进挂号记录）。
+# 花括号刻意避开，避免与提示词模板的格式化冲突。
+_WEEKDAYS = "一二三四五六日"
+
+
+def _today_block() -> str:
+    today = date.today()
+    return (
+        "## 当前日期（系统注入，必读）\n"
+        f"今天是 {today.isoformat()}，星期{_WEEKDAYS[today.weekday()]}。\n"
+        "用户说\"明天/后天/下周X\"时，请基于今天换算出具体的 YYYY-MM-DD 再调用工具，"
+        "不得使用训练记忆里的年份；拿不准就按相对词换算，禁止编造日期。"
+    )
+
+
 _AGENT_CODE = "guide"
 _DEFAULT_TEMPERATURE = 0.1
 _DEFAULT_TOOLS = [
@@ -60,6 +77,7 @@ def _build(cfg: AgentRuntimeConfig) -> Any:
         default_prompt=GUIDE_SYSTEM_PROMPT,
         default_tools=_DEFAULT_TOOLS,
         default_temperature=_DEFAULT_TEMPERATURE,
+        prompt_suffix=_today_block(),
     )
 
 
@@ -68,6 +86,15 @@ def create_guide_agent():
     return _build(get_active_config(_AGENT_CODE))
 
 
+# 单例里固化了构建当天的日期锚点；服务跨天常驻时必须重建，否则"明天"又会算错
+_built_on: date | None = None
+
+
 def get_guide_agent():
-    """取单例：Agent 配置保存/发布后自动重建。"""
+    """取单例：Agent 配置保存/发布后自动重建，跨天后也重建以刷新日期锚点。"""
+    global _built_on
+    today = date.today()
+    if _built_on != today:
+        reset_agent_cache()
+        _built_on = today
     return get_runtime_agent(_AGENT_CODE, _build)

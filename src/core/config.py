@@ -96,9 +96,30 @@ class Settings(BaseSettings):
     VL_OCR_TIMEOUT: float = 90.0      # 单张图片识别超时（秒），图片比文本慢，不能复用 LLM_TIMEOUT
     VL_OCR_MAX_SIDE: int = 1600       # 上传前把长边压到该像素，控制 token 与耗时
 
+    # 聊天图片问答：患者随消息上传图片，先用视觉模型转成文字再进对话。
+    # 超时不能照搬 VL_OCR_TIMEOUT（90s）——它发生在 SSE 首字节前，太长会顶到前端等待上限。
+    IMAGE_QA_ENABLED: bool = True
+    IMAGE_QA_TIMEOUT: float = 45.0
+    IMAGE_QA_MAX_BYTES: int = 6_000_000   # 原始图片字节上限，超过直接跳过（前端已压缩到 ~500KB）
+
+    # 语音（ASR/TTS）：走 DashScope 的 omni / tts 模型，音频只在内存里流转，不落地不落库
+    VOICE_ENABLED: bool = True
+    VOICE_ASR_MODEL: str = "qwen3.5-omni-flash"   # 网关里唯一实测能一次性转写中文的模型（input_audio + data URL）
+    VOICE_TTS_MODEL: str = "qwen3-tts-flash"      # 原生 multimodal-generation 端点返回 wav
+    VOICE_TTS_VOICE: str = "Cherry"
+    VOICE_TIMEOUT: float = 60.0
+    VOICE_MAX_UPLOAD_BYTES: int = 10_000_000      # 单次录音上限，约 16k 单声道 5 分钟
+    VOICE_MAX_TTS_CHARS: int = 600                # 单次朗读文本上限，过长前端自己截断
+
     # LLM 请求参数
     LLM_TIMEOUT: float = 60.0  # 单次请求超时（秒）
     LLM_MAX_RETRIES: int = 2  # 请求失败自动重试次数
+    # 流式调用是否显式索取 token 用量：
+    # OpenAI 兼容网关只有在请求里带 stream_options={"include_usage": true} 时，
+    # 才会在流末尾多回一帧 usage；不带则整轮 usage 恒为 0（DashScope 实测）。
+    # langchain 的 stream_usage 默认只在已知模型（gpt-4o 等）上开启，qwen/deepseek
+    # 这类模型不会被自动识别，必须显式打开，否则 token_usage 全落 0。
+    LLM_STREAM_USAGE: bool = True
     LLM_MAX_CONCURRENCY: int = 200  # 单进程 LLM 并发上限（2 worker × 200 = 400）
     TURN_TIMEOUT: float = 240.0  # 单轮对话（整条 agent/图链路）总超时（秒）
     # 取值下限由「单次 LLM 调用的最坏耗时」决定：
@@ -124,6 +145,13 @@ class Settings(BaseSettings):
     RETRIEVAL_TOP_K: int = 20          # 向量粗检索条数
     RERANK_TOP_K: int = 5              # 精排后保留条数
     MILVUS_NPROBE: int = 16            # Milvus 检索精度（越大越准越慢）
+
+    # 关键词召回（BM25）：补向量检索对专有名词/缩写的短板，与向量结果 RRF 融合
+    ENABLE_BM25: bool = True
+    BM25_TOP_K: int = 20               # BM25 单路召回条数
+    BM25_WEIGHT: float = 1.0           # RRF 里的通道权重，想让向量占主导就调小
+    BM25_MAX_INDEX_DOCS: int = 2000    # 超过这个 chunk 数就不建内存索引，退回纯向量
+    BM25_INDEX_TTL_SECONDS: float = 300.0  # 索引有效期，知识库增删后靠它自动重建
     GRAPH_RAG_RECORD_LIMIT: int = 20   # 图谱 RAG 单条 Cypher 取回上限
     NL2SQL_MAX_RETRIES: int = 2        # SQL 重试次数
     NL2SQL_TIMEOUT_SECONDS: int = 10   # 单条 SQL 执行超时（秒）
@@ -260,6 +288,7 @@ def _build_candidate_client(candidate: ModelCandidate, temperature: float) -> Ch
         temperature=temperature,
         timeout=s.LLM_TIMEOUT,
         max_retries=s.LLM_MAX_RETRIES,
+        stream_usage=s.LLM_STREAM_USAGE,
         http_client=sync_client,
         http_async_client=async_client,
     )
@@ -422,6 +451,7 @@ def get_llm(temperature: float = 0.7, model: str | None = None) -> ChatOpenAI:
         temperature=temperature,
         timeout=s.LLM_TIMEOUT,
         max_retries=s.LLM_MAX_RETRIES,
+        stream_usage=s.LLM_STREAM_USAGE,
         http_client=sync_client,
         http_async_client=async_client,
     )
@@ -450,6 +480,7 @@ def build_llm(
         temperature=temperature,
         timeout=s.LLM_TIMEOUT,
         max_retries=s.LLM_MAX_RETRIES,
+        stream_usage=s.LLM_STREAM_USAGE,
         http_client=sync_client,
         http_async_client=async_client,
     )

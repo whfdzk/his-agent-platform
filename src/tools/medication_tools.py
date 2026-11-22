@@ -19,6 +19,7 @@ from loguru import logger
 from sqlalchemy import or_, select
 
 from src.core.context import UserContext
+from src.core.concurrency import to_thread
 from src.tools.runtime import GUEST_HINT, resolve_patient_id
 
 # 说明书章节 → (展示名, DrugDetail 字段)
@@ -91,10 +92,12 @@ async def _search_instruction_docs(drug_name: str, section: str) -> str:
 
     question = f"{drug_name}的{SECTION_FIELDS.get(section, ('说明书', ''))[0]}"
     try:
+        # 同步建连放进线程池，避免阻塞事件循环
+        milvus_client = await to_thread(get_milvus_client)
         return await search_docs(
             question=question,
             embedding_model=get_embeddings(),
-            milvus_client=get_milvus_client(),
+            milvus_client=milvus_client,
             llm=get_llm(temperature=0.1),
             doc_type="drug_instruction",
             role="patient",

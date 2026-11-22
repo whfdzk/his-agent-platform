@@ -10,10 +10,10 @@ from sqlalchemy import BigInteger, DateTime, Index, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
-from src.core.base_model import BaseModel
+from src.core.base_model import BaseModel, TenantMixin
 
 
-class Conversation(BaseModel):
+class Conversation(BaseModel, TenantMixin):
     """会话：user_id + session_id 唯一。"""
     __tablename__ = "conversations"
 
@@ -26,10 +26,13 @@ class Conversation(BaseModel):
 
     __table_args__ = (
         Index("uq_conversation_user_session", "user_id", "session_id", unique=True),
+        Index("ix_conversation_last_active", "last_active_at"),
+        Index("ix_conversations_tenant", "tenant_id"),
+        Index("ix_conversations_tenant_user_updated", "tenant_id", "user_id", "updated_at"),
     )
 
 
-class ChatMessage(BaseModel):
+class ChatMessage(BaseModel, TenantMixin):
     """消息：与 SSE 事件一一对应（token 聚合后的完整消息粒度）。"""
     __tablename__ = "chat_messages"
 
@@ -42,7 +45,13 @@ class ChatMessage(BaseModel):
         String(64), nullable=True, comment="客户端幂等键，重复提交去重"
     )
     role: Mapped[str] = mapped_column(String(20), nullable=False, comment="user/assistant/system")
-    content: Mapped[str] = mapped_column(Text, default="", comment="消息文本内容")
+    content: Mapped[str] = mapped_column(Text, default="", comment="消息文本内容（原文，仅限临床审计追溯）")
+    # PHI 双列：原文列保留（病历追溯与纠纷举证需要原貌），对外一律读脱敏列，
+    # 避免管理端列表、导出、二次训练语料把身份证/手机号原样带走
+    content_redacted: Mapped[str] = mapped_column(
+        Text, default="", server_default="",
+        comment="PHI 脱敏后的消息文本（对外展示/导出/统计使用）",
+    )
     event_type: Mapped[str] = mapped_column(
         String(20), default="token", comment="消息类型：token/clarify/appointment/error/interrupted"
     )
@@ -53,4 +62,5 @@ class ChatMessage(BaseModel):
     __table_args__ = (
         Index("uq_chat_message_conv_seq", "conversation_id", "seq", unique=True),
         Index("ix_chat_message_client_msg_id", "client_message_id"),
+        Index("ix_chat_messages_tenant", "tenant_id"),
     )

@@ -77,7 +77,10 @@ def build_knowledge_tools(deps: KnowledgeDeps | None = None) -> list:
         """从知识文档库中检索信息并生成回答。
         适用：查询临床指南、药品说明书、医院制度SOP、医学文献等文档内容。
         question: 用户的问题
-        doc_type: 可选，文档类型过滤（guideline/drug_instruction/sop/literature）"""
+        doc_type: 可选，文档类型过滤（guideline/drug_instruction/sop/literature）。
+            谨慎使用：只有确定答案一定在该类文档里时才传，否则留空查全库。
+            问"某类药的禁忌/不良反应/能不能用"时通常不要过滤——
+            禁忌和适应证多写在指南里，只查说明书会漏掉关键条款。"""
         from src.knowledge.doc_rag import search_docs
 
         try:
@@ -196,6 +199,44 @@ def build_knowledge_tools(deps: KnowledgeDeps | None = None) -> list:
             return "多通道检索暂时失败，请基于通用医学常识回答，并提示用户稍后再查。"
 
     @tool
+    async def search_knowledge_agentic(question: str) -> str:
+        """自主多轮检索：自行判断要不要检索、走文档还是图谱，证据不足时带着"缺什么"
+        改写检索式再查一轮（最多 2 轮，有停止条件），最后给带来源的回答。
+        适用：复杂临床问题，需要同时看指南条款与实体关系，一次检索通常答不全。
+        例如："糖尿病肾病合并高血压该怎么选降压药"、"ACEI 引起干咳能换成什么药"。
+        question: 用户的问题"""
+        from src.knowledge.agentic_rag import run_agentic_rag
+
+        try:
+            d = _deps()
+        except _DepsUnavailable:
+            return "知识检索依赖未初始化，请基于通用医学常识回答，并说明资料暂缺。"
+
+        if (d.milvus_client is None or d.embedding_model is None) and d.neo4j_driver is None:
+            return "知识库暂时不可用，请基于通用医学常识回答，并说明资料暂缺。"
+
+        try:
+            with Timer() as t:
+                result = await run_agentic_rag(question, d)
+            if not result.need_retrieval:
+                # 交给 Agent 用常识回答，不要硬塞一次检索结果
+                return result.answer
+            QueryAuditLog.log(
+                d.user_id, d.role, question, "agentic",
+                (sorted({c for r in result.rounds for c in r.channels}) or ["doc_rag"]),
+                result.answer[:80], t.elapsed_ms,
+            )
+            logger.info(
+                f"AgenticRAG 完成 | 轮次={len(result.rounds)} "
+                f"证据 doc={len(result.doc_hits)} graph={len(result.graph_records)} "
+                f"停止={result.stop_reason} 耗时={t.elapsed_ms:.0f}ms"
+            )
+            return f"{result.header()}\n\n{result.answer}"
+        except Exception as e:
+            logger.warning(f"AgenticRAG 失败: {type(e).__name__}: {e}")
+            return "自主检索暂时失败，请基于通用医学常识回答，并提示用户稍后再查。"
+
+    @tool
     async def review_prescription_tool(question: str) -> str:
         """处方审核：校验处方中的药品剂量、配伍禁忌、过敏冲突、重复用药。
         适用：患者咨询"这两种药能否同服"、药师审核处方安全性、医生确认用药方案是否合理。
@@ -285,6 +326,7 @@ def build_knowledge_tools(deps: KnowledgeDeps | None = None) -> list:
         search_knowledge_graph,
         search_knowledge_sql,
         search_knowledge_multi,
+        search_knowledge_agentic,
         review_prescription_tool,
         list_knowledge_sources,
     ]

@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import get_current_admin
+from src.api.deps import AdminIdentity, get_current_admin, require_scope
 from src.core.exceptions import BizErrorCode, BizException
 from src.infra.database import get_db
 from src.modules.chat.model import ChatMessage, Conversation
@@ -20,7 +20,8 @@ from src.knowledge.model import KnowledgeFeedback
 router = APIRouter(
     prefix="/api/v1/admin/conversations",
     tags=["admin-conversations"],
-    dependencies=[Depends(get_current_admin)],
+    # 会话明细 + 审计视图：B1 起额外要求 audit:read（admin 角色自带，operator/viewer 类角色可细化）
+    dependencies=[Depends(get_current_admin), Depends(require_scope("audit:read"))],
 )
 
 
@@ -44,13 +45,14 @@ async def list_conversations(
     user_id: str | None = None,
     page: int = 1,
     page_size: int = 20,
+    admin: AdminIdentity = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """会话列表：keyword 匹配标题/会话 ID。"""
     page = max(page, 1)
     page_size = min(max(page_size, 1), 100)
 
-    q = select(Conversation)
+    q = select(Conversation).where(Conversation.tenant_id == admin.tenant_id)
     if keyword:
         like = f"%{keyword}%"
         q = q.where((Conversation.title.like(like)) | (Conversation.session_id.like(like)))
@@ -70,7 +72,11 @@ async def list_conversations(
     if ids:
         count_rows = (await db.execute(
             select(ChatMessage.conversation_id, func.count())
-            .where(ChatMessage.conversation_id.in_(ids)).group_by(ChatMessage.conversation_id)
+            .where(
+                ChatMessage.conversation_id.in_(ids),
+                ChatMessage.tenant_id == admin.tenant_id,
+            )
+            .group_by(ChatMessage.conversation_id)
         )).all()
         counts = {cid: n for cid, n in count_rows}
 
@@ -86,14 +92,19 @@ async def list_conversations(
 async def get_messages(
     conversation_id: int,
     limit: int = 200,
+    admin: AdminIdentity = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """会话消息明细（审计视角：全量角色）。"""
     conv = await db.get(Conversation, conversation_id)
-    if not conv:
+    if not conv or int(conv.tenant_id or 1) != int(admin.tenant_id):
         raise BizException(BizErrorCode.NOT_FOUND, "会话不存在", status_code=404)
     rows = (await db.execute(
-        select(ChatMessage).where(ChatMessage.conversation_id == conversation_id)
+        select(ChatMessage)
+        .where(
+            ChatMessage.conversation_id == conversation_id,
+            ChatMessage.tenant_id == admin.tenant_id,
+        )
         .order_by(ChatMessage.seq).limit(min(limit, 500))
     )).scalars().all()
     return {
@@ -103,7 +114,8 @@ async def get_messages(
                 "id": m.id,
                 "seq": m.seq,
                 "role": m.role,
-                "content": m.content,
+                # 对外展示只用脱敏列：原文列仅限临床审计追溯，不经普通后台接口输出
+                "content": m.content_redacted or m.content,
                 "event_type": m.event_type,
                 "turn_id": m.turn_id,
                 "created_at": str(m.created_at) if m.created_at else None,
@@ -119,12 +131,17 @@ class ConversationStatusUpdate(BaseModel):
 
 
 @router.patch("/{conversation_id}/status")
-async def update_conversation_status(conversation_id: int, req: ConversationStatusUpdate, db: AsyncSession = Depends(get_db)):
+async def update_conversation_status(
+    conversation_id: int,
+    req: ConversationStatusUpdate,
+    admin: AdminIdentity = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
     """关闭 / 恢复会话。"""
     if req.status not in {"active", "closed"}:
         raise BizException(BizErrorCode.PARAM_ERROR, "status 只能是 active/closed", status_code=400)
     conv = await db.get(Conversation, conversation_id)
-    if not conv:
+    if not conv or int(conv.tenant_id or 1) != int(admin.tenant_id):
         raise BizException(BizErrorCode.NOT_FOUND, "会话不存在", status_code=404)
     conv.status = req.status
     await db.flush()
@@ -136,12 +153,15 @@ async def list_feedback(
     rating: int | None = None,
     page: int = 1,
     page_size: int = 20,
+    admin: AdminIdentity = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """用户反馈收集：患者端对 AI 回答的 👍/👎 与评论。"""
     page = max(page, 1)
     page_size = min(max(page_size, 1), 100)
-    q = select(KnowledgeFeedback)
+    q = select(KnowledgeFeedback).where(
+        KnowledgeFeedback.tenant_id == admin.tenant_id,
+    )
     if rating in (1, -1):
         q = q.where(KnowledgeFeedback.rating == rating)
 

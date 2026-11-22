@@ -24,3 +24,13 @@ class TimestampMixin:
 class BaseModel(Base, TimestampMixin):
     __abstract__ = True
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+
+# C1 多租户：行级隔离列。
+# 表上已有 server_default='1'（存量数据回填），但应用层写入必须显式传 tenant_id ——
+# 依赖默认值会让新租户的数据静默落进默认租户。
+class TenantMixin:
+    tenant_id: Mapped[int] = mapped_column(
+        BigInteger, server_default="1", nullable=False,
+        comment="租户 id（tenants.id），存量归默认租户 1",
+    )

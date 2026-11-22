@@ -5,14 +5,17 @@
   "workspaces": [
     "shared",
     "patient",
-    "admin"
+    "admin",
+    "clinician"
   ],
   "scripts": {
     "dev:p": "npm run dev -w patient",
     "dev:a": "npm run dev -w admin",
+    "dev:c": "npm run dev -w clinician",
     "build": "npm run build -ws --if-present",
     "build:patient": "npm run build -w patient",
-    "build:admin": "npm run build -w admin"
+    "build:admin": "npm run build -w admin",
+    "build:clinician": "npm run build -w clinician"
   },
   "engines": {
     "node": ">=18"

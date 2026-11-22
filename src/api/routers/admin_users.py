@@ -54,6 +54,12 @@ def _serialize(p: Patient, conversations: int = 0, appointments: int = 0) -> dic
     }
 
 
+def _assert_tenant(p: Patient, admin) -> None:
+    """跨租户访问一律 404（不暴露别院是否有这个患者）。"""
+    if int(p.tenant_id) != int(admin.tenant_id):
+        raise BizException(BizErrorCode.NOT_FOUND, "用户不存在", status_code=404)
+
+
 class UserUpdate(BaseModel):
     name: str | None = Field(default=None, max_length=100)
     gender: str | None = Field(default=None, max_length=10)
@@ -69,13 +75,18 @@ async def list_users(
     enabled: bool | None = None,
     page: int = 1,
     page_size: int = 20,
+    admin=Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """用户列表：keyword 匹配姓名/手机号；enabled 过滤账号状态。"""
+    """用户列表：keyword 匹配姓名/手机号；enabled 过滤账号状态。
+
+    C1：只列本租户的患者 —— 管理端拿不到别家医院的用户，
+    否则同一个手机号在两院都有账号时，A 院搜索会打出 B 院的档案。
+    """
     page = max(page, 1)
     page_size = min(max(page_size, 1), 100)
 
-    q = select(Patient)
+    q = select(Patient).where(Patient.tenant_id == admin.tenant_id)
     if keyword:
         like = f"%{keyword}%"
         q = q.where((Patient.name.like(like)) | (Patient.phone.like(like)))
@@ -112,7 +123,7 @@ async def list_users(
 
 
 @router.get("/{user_id}")
-async def get_user(user_id: int, db: AsyncSession = Depends(get_db)):
+async def get_user(user_id: int, admin=Depends(get_current_admin), db: AsyncSession = Depends(get_db)):
     """患者详情聚合：基本资料 + 健康档案 + 最近会话/预约 + 会员状态。
 
     只读视图：管理端修改资料走 PUT，避免详情页误改数据。
@@ -120,6 +131,7 @@ async def get_user(user_id: int, db: AsyncSession = Depends(get_db)):
     p = await db.get(Patient, user_id)
     if not p:
         raise BizException(BizErrorCode.NOT_FOUND, "用户不存在", status_code=404)
+    _assert_tenant(p, admin)
 
     convs = (await db.execute(
         select(func.count()).select_from(Conversation).where(Conversation.user_id == str(user_id))
@@ -205,11 +217,12 @@ async def get_user(user_id: int, db: AsyncSession = Depends(get_db)):
 
 
 @router.put("/{user_id}")
-async def update_user(user_id: int, req: UserUpdate, db: AsyncSession = Depends(get_db)):
+async def update_user(user_id: int, req: UserUpdate, admin=Depends(get_current_admin), db: AsyncSession = Depends(get_db)):
     """基本资料维护。"""
     p = await db.get(Patient, user_id)
     if not p:
         raise BizException(BizErrorCode.NOT_FOUND, "用户不存在", status_code=404)
+    _assert_tenant(p, admin)
     for k, v in req.model_dump(exclude_none=True).items():
         setattr(p, k, v)
     await db.flush()
@@ -217,11 +230,12 @@ async def update_user(user_id: int, req: UserUpdate, db: AsyncSession = Depends(
 
 
 @router.patch("/{user_id}/status")
-async def update_user_status(user_id: int, enabled: bool, db: AsyncSession = Depends(get_db)):
+async def update_user_status(user_id: int, enabled: bool, admin=Depends(get_current_admin), db: AsyncSession = Depends(get_db)):
     """账号状态管理：禁用后患者端登录被拒。"""
     p = await db.get(Patient, user_id)
     if not p:
         raise BizException(BizErrorCode.NOT_FOUND, "用户不存在", status_code=404)
+    _assert_tenant(p, admin)
     p.enabled = enabled
     await db.flush()
     return {"message": "已启用" if enabled else "已禁用", "user": _serialize(p)}

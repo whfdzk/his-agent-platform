@@ -22,8 +22,11 @@ async def rerank_docs(
     if not documents:
         return []
 
-    if len(documents) <= top_k:
-        return documents
+    # 只有 1 条时没有可重排的余地。
+    # 注意不能写成 len(documents) <= top_k：候选数本来就不多时（知识库小、或过滤后剩几条），
+    # 这个条件恒成立，精排会被永久跳过——顺序也就永远停在粗检索的顺序上。
+    if len(documents) <= 1:
+        return documents[:top_k]
 
     try:
         import dashscope

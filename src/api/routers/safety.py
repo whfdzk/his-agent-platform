@@ -66,12 +66,13 @@ async def list_events(
     days: int = 7,
     limit: int = 50,
     offset: int = 0,
+    admin: AdminIdentity = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    since = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 365)))
+    since = datetime.utcnow() - timedelta(days=max(1, min(days, 365)))
     q = (
         select(SafetyEvent)
-        .where(SafetyEvent.created_at >= since)
+        .where(SafetyEvent.created_at >= since, SafetyEvent.tenant_id == admin.tenant_id)
         .order_by(SafetyEvent.created_at.desc())
         .limit(max(1, min(limit, 200)))
         .offset(max(0, offset))
@@ -90,11 +91,18 @@ async def list_events(
 
 
 @router.get("/events/pending")
-async def list_pending(db: AsyncSession = Depends(get_db), limit: int = 50):
+async def list_pending(
+    admin: AdminIdentity = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+    limit: int = 50,
+):
     rows = (
         await db.execute(
             select(SafetyEvent)
-            .where(SafetyEvent.review_status == "pending")
+            .where(
+                SafetyEvent.review_status == "pending",
+                SafetyEvent.tenant_id == admin.tenant_id,
+            )
             .order_by(SafetyEvent.created_at.asc())
             .limit(max(1, min(limit, 200)))
         )
@@ -111,7 +119,12 @@ async def review_event(
 ):
     """人工复核：确认拦截合理（approved）或误报（rejected）。"""
     event = (
-        await db.execute(select(SafetyEvent).where(SafetyEvent.id == event_id))
+        await db.execute(
+            select(SafetyEvent).where(
+                SafetyEvent.id == event_id,
+                SafetyEvent.tenant_id == admin.tenant_id,
+            )
+        )
     ).scalar_one_or_none()
     if event is None:
         raise BizException(BizErrorCode.NOT_FOUND, "安全事件不存在", status_code=404)
@@ -125,45 +138,55 @@ async def review_event(
 
 
 @router.get("/stats")
-async def safety_stats(days: int = 30, db: AsyncSession = Depends(get_db)):
-    since = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 365)))
+async def safety_stats(
+    days: int = 30,
+    admin: AdminIdentity = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    since = datetime.utcnow() - timedelta(days=max(1, min(days, 365)))
+    tenant = SafetyEvent.tenant_id == admin.tenant_id
     total = (
         await db.execute(
-            select(func.count()).select_from(SafetyEvent).where(SafetyEvent.created_at >= since)
+            select(func.count()).select_from(SafetyEvent)
+            .where(SafetyEvent.created_at >= since, tenant)
         )
     ).scalar() or 0
     pending = (
         await db.execute(
             select(func.count())
             .select_from(SafetyEvent)
-            .where(SafetyEvent.created_at >= since, SafetyEvent.review_status == "pending")
+            .where(
+                SafetyEvent.created_at >= since,
+                SafetyEvent.review_status == "pending",
+                tenant,
+            )
         )
     ).scalar() or 0
     by_level = (
         await db.execute(
             select(SafetyEvent.level, func.count())
-            .where(SafetyEvent.created_at >= since)
+            .where(SafetyEvent.created_at >= since, tenant)
             .group_by(SafetyEvent.level)
         )
     ).all()
     by_category = (
         await db.execute(
             select(SafetyEvent.category, func.count())
-            .where(SafetyEvent.created_at >= since)
+            .where(SafetyEvent.created_at >= since, tenant)
             .group_by(SafetyEvent.category)
         )
     ).all()
     by_action = (
         await db.execute(
             select(SafetyEvent.action, func.count())
-            .where(SafetyEvent.created_at >= since)
+            .where(SafetyEvent.created_at >= since, tenant)
             .group_by(SafetyEvent.action)
         )
     ).all()
     top_rules = (
         await db.execute(
             select(SafetyEvent.rule_id, SafetyEvent.rule_name, func.count())
-            .where(SafetyEvent.created_at >= since, SafetyEvent.rule_id != "")
+            .where(SafetyEvent.created_at >= since, SafetyEvent.rule_id != "", tenant)
             .group_by(SafetyEvent.rule_id, SafetyEvent.rule_name)
             .order_by(func.count().desc())
             .limit(10)

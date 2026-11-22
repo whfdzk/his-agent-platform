@@ -8,6 +8,10 @@ export interface ChatRequest {
   session_id: string;
   message: string;
   patient_id?: number | null;
+  /** 随消息上传的图片（data URL 或裸 base64），后端转文字后并入对话；不落库 */
+  image_base64?: string | null;
+  /** 图片原始文件名（仅用于诊断日志） */
+  image_name?: string | null;
   /** 客户端幂等键：同一消息重试时复用，服务端据此去重 */
   client_message_id?: string;
 }
@@ -15,6 +19,7 @@ export interface ChatRequest {
 /** 后端 SSE 事件（POST /api/v1/chat/stream） */
 export type ChatEvent =
   | { type: 'token'; content: string; seq?: number }
+  | { type: 'status'; content: string; seq?: number }
   | { type: 'clarify'; question: string; seq?: number }
   | { type: 'appointment'; data: AppointmentData; seq?: number }
   | {
@@ -27,7 +32,54 @@ export type ChatEvent =
       seq?: number;
     }
   | { type: 'done'; session_id: string }
+  | { type: 'citation'; items: CitationRef[]; seq?: number }
+  | { type: 'confirm_request'; data: ConfirmRequestData; seq?: number }
   | { type: 'error'; message: string; code?: string; retryable?: boolean };
+
+/**
+ * 待确认高危动作（B2：后端 clinical_actions 状态机，SSE confirm_request 下发）。
+ * 后端在下发这张卡之前不会真正建预约/转诊——用户点「确认」后才执行。
+ */
+export interface ConfirmRequestData {
+  id: number;
+  /** appointment=挂号；handoff=问诊出结论后的转诊建单 */
+  action_type: 'appointment' | 'handoff' | 'medication' | 'order' | string;
+  status?: string;
+  summary: string;
+  session_id?: string | null;
+  /** ISO 时间；过期后点确认会返回 410，需重新发起 */
+  expires_at?: string | null;
+  /** 仅白名单字段：科室/日期/时段/医生/诊断/挂号费 */
+  preview?: {
+    department?: string;
+    date?: string;
+    time_slot?: string;
+    doctor_name?: string;
+    /** 草稿锁定的医生账号；改选医生后后端会回传新值，为空表示待分配 */
+    doctor_clinician_id?: number | null;
+    diagnosis?: string | null;
+    fee?: number;
+  };
+}
+
+/**
+ * 回答引用的知识片段定位（后端 citations 表 / SSE citation 事件）。
+ * 一条 = 一次检索命中的片段，用于让用户核对"这个结论出自哪里"。
+ */
+export interface CitationRef {
+  doc_name: string;
+  doc_type?: string;
+  /** 检索通道：milvus / neo4j */
+  engine?: string;
+  /** 页码；0 或 null 表示该文档没有页码（如纯文本指南），展示时省略 */
+  page_number?: number | null;
+  /** 片段序号（同一文档内的分块位置） */
+  chunk_index?: number | null;
+  /** 相关度分：向量相似度与 RRF 融合分并存，仅用于排序，不直接展示 */
+  score?: number | null;
+  /** 命中片段摘句（已截断并做过 PHI 脱敏） */
+  quote?: string;
+}
 
 export interface ChatMessage {
   id: string;
@@ -35,11 +87,24 @@ export interface ChatMessage {
   content: string;
   streaming?: boolean;
   stopped?: boolean;
+  /** 用户消息附带的图片预览（本地 objectURL，仅本次会话可见，不随历史回放） */
+  imageUrl?: string;
   /** 挂号卡片数据（role=handoff 时） */
   appointment?: AppointmentData;
   /** Safety Engine 输出审核提示（如已追加免责声明 / 已阻断） */
   safetyNotice?: string;
   safetyLevel?: 'info' | 'warn' | 'high' | 'critical';
+  /** 该条回答引用的知识片段（后端 citation 事件下发） */
+  citations?: CitationRef[];
+  /** B2：待患者确认的高危动作（后端 confirm_request 事件下发） */
+  confirm?: ConfirmRequestData;
+  /** 确认卡片本地状态：pending=待操作，approved/rejected=已处理，expired=超时失效 */
+  confirmState?: 'pending' | 'approved' | 'rejected' | 'expired';
+  /**
+   * C3：这条身子是坐席（真人）说的，不是模型说的。
+   * handoff_close 是"人工环节结束"的系统收尾。仅用于气泡样式标注，不写进历史。
+   */
+  fromAgent?: 'human_agent' | 'handoff_close';
 }
 
 // ── 挂号 ───────────────────────────────────────────────────────────────
@@ -48,6 +113,8 @@ export interface AppointmentData {
   appointment_no: string;
   department: string;
   doctor_name: string;
+  /** 接诊医生账号；为空说明这条预约没有关联到具体医生（不会自动建立接诊关系） */
+  doctor_clinician_id?: number | null;
   date: string;
   time_slot: string;
   fee: number;
@@ -76,6 +143,10 @@ export interface SessionSummary {
 export interface HistoryMessage {
   role: 'user' | 'assistant';
   content: string;
+  /** 会话内序号（只有 PG 落库的消息才有；checkpointer 补出来的消息为 null） */
+  seq?: number | null;
+  /** human_agent = 坐席回复，handoff_close = 人工环节收尾，其余按普通气泡渲染 */
+  event_type?: string | null;
 }
 
 /** 断线重连时拉取的已落库事件 */
@@ -876,3 +947,159 @@ export interface UserSubscriptionItem {
   expire_at: string | null;
   status: 'active' | 'expired';
 }
+
+// ── C4：医护端（按科室 / 责任患者授权） ───────────────────────────────
+
+export interface ClinicianScopeInfo {
+  clinician_id: number;
+  roles: string[];
+  department_names: string[];
+  patient_ids: number[];
+  patient_count: number;
+  primary_department_id: number | null;
+  can_decide_pending: boolean;
+}
+
+export type ClinicianAlertLevel = 'red' | 'orange' | 'yellow' | 'green';
+export type ClinicianVisibleReason = 'responsible' | 'department_alert';
+
+export interface ClinicianAlertItem {
+  id: number;
+  event_type: string;
+  level: ClinicianAlertLevel;
+  level_label: string;
+  reason: string;
+  symptoms: string[];
+  patient_id: number | null;
+  session_id: string;
+  thread_id: string;
+  source: string;
+  created_at: string | null;
+  /** 为什么这条出现在我的看板里：责任患者 / 本科室高危 */
+  visible_reason: ClinicianVisibleReason;
+}
+
+export interface ClinicianAlertList {
+  items: ClinicianAlertItem[];
+  total: number;
+  /** 候选池被打满：更早的事件没有进入过滤，列表可能不是全量 */
+  truncated: boolean;
+  department_names: string[];
+}
+
+export interface ClinicianPatientItem {
+  patient_id: number;
+  name: string;
+  gender: string | null;
+  age: number | null;
+  relation: string;
+  department_ids: number[];
+  recent_departments: string[];
+  latest_alert: {
+    id: number;
+    level: ClinicianAlertLevel;
+    level_label: string;
+    created_at: string | null;
+  } | null;
+  visible_reason: ClinicianVisibleReason;
+}
+
+export interface ClinicianPatientList {
+  items: ClinicianPatientItem[];
+  total: number;
+}
+
+export interface ClinicianPendingAction {
+  id: number;
+  action_type: string;
+  status: string;
+  summary: string;
+  session_id: string;
+  expires_at: string | null;
+  decided_at: string | null;
+  decided_by: string | null;
+  reject_reason: string | null;
+  result_ref: string | null;
+  preview: Record<string, string | number | null>;
+  created_at: string | null;
+  /** 医护端补的归属字段（患者端不再下发，避免越权推断） */
+  patient_id: number | null;
+  patient_name: string;
+}
+
+export interface ClinicianPendingList {
+  items: ClinicianPendingAction[];
+  total: number;
+  can_decide: boolean;
+}
+
+export interface ClinicianDecisionResult {
+  status: string;
+  result_ref: string | null;
+  action_type?: string;
+  data?: Record<string, unknown>;
+}
+
+// ── C3：人工接管（坐席台） ────────────────────────────────────────────────
+// 工单状态机：open(待认领) → claimed(处理中) → resolved(已结单) / closed；
+// cancelled 是患者撤回。后端 serialize 见 src/modules/handoff/service.py。
+
+export type HandoffTicketStatus = 'open' | 'claimed' | 'resolved' | 'closed' | 'cancelled';
+
+export interface HandoffTicket {
+  id: number;
+  ticket_no: string;
+  patient_id: number;
+  session_id: string;
+  conversation_id: number | null;
+  status: HandoffTicketStatus;
+  priority: string;
+  reason: string;
+  summary: string;
+  payload: Record<string, unknown>;
+  assigned_to: number | null;
+  assigned_name: string;
+  claimed_at: string;
+  resolved_at: string;
+  resolution: string;
+  message_count: number;
+  last_message_at: string;
+  created_at: string;
+}
+
+export interface HandoffQueue {
+  items: HandoffTicket[];
+  total: number;
+  stats: {
+    open: number;
+    claimed: number;
+    resolved: number;
+    closed: number;
+    cancelled: number;
+  };
+}
+
+export interface HandoffSessionMessage {
+  seq: number;
+  role: string;
+  content: string;
+  event_type: string;
+}
+
+/**
+ * 工单推送帧（GET /api/v1/handoff/stream）。
+ * patient 主题：snapshot（首帧）→ ticket（状态变化）/ message（坐席或收尾正文）
+ * seat 主题：ready（首帧）→ queue（"列表变了，自己重拉"）
+ */
+export type HandoffStreamEvent =
+  | { type: 'snapshot'; items: HandoffTicket[] }
+  | { type: 'ticket'; ticket: HandoffTicket }
+  | {
+      type: 'message';
+      ticket_no: string;
+      content: string;
+      event_type: 'human_agent' | 'handoff_close' | string;
+      message_count: number;
+    }
+  | { type: 'ready'; scope: string }
+  | { type: 'queue'; ticket_no?: string };

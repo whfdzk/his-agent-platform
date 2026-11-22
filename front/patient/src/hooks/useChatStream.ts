@@ -1,10 +1,20 @@
 import { useCallback, useRef, useSyncExternalStore } from 'react';
-import { sessionApi, streamChat, type AppointmentData, type ChatMessage } from '@his/shared';
+import { sessionApi, streamChat, clinicalActionApi, type AppointmentData, type ChatMessage } from '@his/shared';
 
 let msgSeq = 0;
 function nextId() {
   return `m${Date.now()}-${msgSeq++}`;
 }
+
+/** 随消息发送的图片（base64 用于上传，previewUrl 用于本地回显） */
+export interface ChatImageAttachment {
+  base64: string;
+  name: string;
+  previewUrl: string;
+}
+
+/** 图片识别期间的占位文案：首个 token 到达即被替换 */
+const IMAGE_PLACEHOLDER = '正在识别图片…';
 
 /** 生成客户端幂等键：重试复用同一 key，服务端 SETNX 去重 */
 function newClientMessageId() {
@@ -80,7 +90,10 @@ export function hasLocalMessages(sid: string): boolean {
 }
 
 /** 用后端历史消息填充会话缓存（只在本地为空时调用） */
-export function seedSessionMessages(sid: string, msgs: { role: string; content: string }[]) {
+export function seedSessionMessages(
+  sid: string,
+  msgs: { role: string; content: string; event_type?: string | null }[],
+) {
   if (hasLocalMessages(sid)) return;
   const messages: ChatMessage[] = msgs
     .filter((m) => m.role === 'user' || m.role === 'assistant')
@@ -88,12 +101,49 @@ export function seedSessionMessages(sid: string, msgs: { role: string; content: 
       id: nextId(),
       role: m.role as 'user' | 'assistant',
       content: m.content,
+      // 历史回放里把坐席回复/收尾话术也标上来源，重开会话不再显示成普通 AI 气泡
+      fromAgent:
+        m.event_type === 'human_agent'
+          ? ('human_agent' as const)
+          : m.event_type === 'handoff_close'
+            ? ('handoff_close' as const)
+            : undefined,
     }));
   updateSession(sid, (s) => ({ ...s, messages }));
 }
 
-/** 正在后台流式运行的其它会话列表（用于顶部徽标） */
-export function useBackgroundSessions(currentSid: string): string[] {
+/**
+ * C3：坐席回复 / 收尾话术直接插进会话缓存。
+ *
+ * 坐席回复写的是 chat_messages 表，患者端的聊天 SSE 这时候是断的
+ * （坐席回话不一定发生在患者正在说话的时候），所以由工单推送流把它送进来。
+ * 判断重复：同一会话最后一条内容相同就跳过（推送可能因重连重放）。
+ */
+export function appendAgentMessage(
+  sid: string,
+  content: string,
+  eventType: 'human_agent' | 'handoff_close' = 'human_agent',
+) {
+  const text = String(content || '').trim();
+  if (!text) return;
+  const state = getCache(sid);
+  const last = state.messages[state.messages.length - 1];
+  if (last && last.role === 'assistant' && last.content === text) return;
+  updateSession(sid, (s) => ({
+    ...s,
+    messages: [
+      ...s.messages,
+      {
+        id: nextId(),
+        role: 'assistant',
+        content: text,
+        fromAgent: eventType,
+      },
+    ],
+  }));
+}
+
+/** 正在后台流式运行的其它会话列表（用于顶部徽标） */export function useBackgroundSessions(currentSid: string): string[] {
   useSyncExternalStore(subscribe, () => version);
   const out: string[] = [];
   cache.forEach((s, sid) => {
@@ -118,14 +168,26 @@ export function useChatStream(userId: string, sessionId: string) {
   const state = useSyncExternalStore(subscribe, () => getCache(sessionId));
 
   const sendMessage = useCallback(
-    async (text: string, onAppointment?: (a: AppointmentData) => void) => {
+    async (text: string, onAppointment?: (a: AppointmentData) => void, image?: ChatImageAttachment) => {
       const sid = sessionRef.current;
       if (getCache(sid).isStreaming) return;
       const trimmed = text.trim();
-      if (!trimmed) return;
+      // 只发图片不写字也允许（拍完照直接问"这是什么"）：此时给个默认提问
+      if (!trimmed && !image) return;
+      const askText = trimmed || '请帮我看看这张图片';
 
-      const userMsg: ChatMessage = { id: nextId(), role: 'user', content: trimmed };
-      const botMsg: ChatMessage = { id: nextId(), role: 'assistant', content: '', streaming: true };
+      const userMsg: ChatMessage = {
+        id: nextId(),
+        role: 'user',
+        content: askText,
+        imageUrl: image?.previewUrl,
+      };
+      const botMsg: ChatMessage = {
+        id: nextId(),
+        role: 'assistant',
+        content: image ? IMAGE_PLACEHOLDER : '',
+        streaming: true,
+      };
       updateSession(sid, (s) => ({
         ...s,
         messages: [...s.messages, userMsg, botMsg],
@@ -142,7 +204,9 @@ export function useChatStream(userId: string, sessionId: string) {
         updateSession(sid, (s) => ({
           ...s,
           messages: s.messages.map((m) =>
-            m.id === botMsg.id ? { ...m, content: m.content + chunk } : m,
+            m.id === botMsg.id
+              ? { ...m, content: (m.content === IMAGE_PLACEHOLDER ? '' : m.content) + chunk }
+              : m,
           ),
         }));
       };
@@ -199,7 +263,13 @@ export function useChatStream(userId: string, sessionId: string) {
         for (let attempt = 1; ; attempt++) {
           try {
             await streamChat(
-              { session_id: sid, message: trimmed, client_message_id: clientMessageId },
+              {
+                session_id: sid,
+                message: trimmed || '请帮我看看这张图片',
+                client_message_id: clientMessageId,
+                image_base64: image?.base64 ?? null,
+                image_name: image?.name ?? null,
+              },
               {
                 signal: controller.signal,
                 token: getToken(),
@@ -207,6 +277,17 @@ export function useChatStream(userId: string, sessionId: string) {
                   switch (event.type) {
                     case 'token':
                       appendBot(event.content);
+                      break;
+                    case 'status':
+                      // 图片识别等前置阶段的状态提示：只占用空白的占位气泡
+                      updateSession(sid, (s) => ({
+                        ...s,
+                        messages: s.messages.map((m) =>
+                          m.id === botMsg.id && (!m.content || m.content === IMAGE_PLACEHOLDER)
+                            ? { ...m, content: event.content }
+                            : m,
+                        ),
+                      }));
                       break;
                     case 'clarify':
                       updateSession(sid, (s) => ({ ...s, clarifyQuestion: event.question }));
@@ -238,6 +319,27 @@ export function useChatStream(userId: string, sessionId: string) {
                                 safetyNotice: event.notice || '该回复已通过安全审核并补充必要提示',
                                 safetyLevel: event.level,
                               }
+                            : m,
+                        ),
+                      }));
+                      break;
+                    case 'citation':
+                      // 引用来源：挂到当前气泡底部，done 后随消息一起展示
+                      updateSession(sid, (s) => ({
+                        ...s,
+                        messages: s.messages.map((m) =>
+                          m.id === botMsg.id ? { ...m, citations: event.items } : m,
+                        ),
+                      }));
+                      break;
+                    case 'confirm_request':
+                      // B2：高危动作确认卡片。此时后端只落了 pending 草稿，
+                      // 号源未占用；用户在卡片上点确认才真正建单。
+                      updateSession(sid, (s) => ({
+                        ...s,
+                        messages: s.messages.map((m) =>
+                          m.id === botMsg.id
+                            ? { ...m, confirm: event.data, confirmState: 'pending' as const }
                             : m,
                         ),
                       }));
@@ -300,7 +402,16 @@ export function useChatStream(userId: string, sessionId: string) {
         updateSession(sid, (s) => ({
           ...s,
           isStreaming: false,
-          messages: s.messages.map((m) => (m.id === botMsg.id ? { ...m, streaming: false } : m)),
+          messages: s.messages.map((m) =>
+            m.id === botMsg.id
+              ? {
+                  ...m,
+                  // 识别占位如果一直没被 token 替换（图片理解失败/直接结束），收尾时清掉
+                  content: m.content === IMAGE_PLACEHOLDER ? '' : m.content,
+                  streaming: false,
+                }
+              : m,
+          ),
         }));
         aborts.delete(sid);
       }
@@ -344,6 +455,44 @@ export function useChatStream(userId: string, sessionId: string) {
     updateSession(sessionRef.current, (s) => ({ ...s, clarifyQuestion: null }));
   }, []);
 
+  /**
+   * B2：刷新/切回会话时，把「仍在等确认」的动作重新挂成卡片。
+   *
+   * 权威状态在 clinical_actions 表，前端内存里的卡片一刷新就没了 ——
+   * 患者回来看到的是"聊完了但预约没下文"，会以为号丢了。
+   * 这里按 session_id 取回待确认动作，挂到最后一条助手消息上。
+   */
+  const restorePending = useCallback(async () => {
+    const sid = sessionRef.current;
+    try {
+      const { items } = await clinicalActionApi.pending();
+      const pick = items.find((it) => it.session_id === sid);
+      if (!pick) return;
+      updateSession(sid, (s) => {
+        // 已经有同一张卡片就不重复挂（例如刚收到 SSE 又触发了一次恢复）
+        if (s.messages.some((m) => m.confirm?.id === pick.id)) return s;
+        const next = [...s.messages];
+        for (let i = next.length - 1; i >= 0; i--) {
+          if (next[i].role === 'assistant') {
+            next[i] = { ...next[i], confirm: pick, confirmState: 'pending' };
+            return { ...s, messages: next };
+          }
+        }
+        next.push({
+          id: `confirm-${pick.id}`,
+          role: 'assistant',
+          content: '',
+          streaming: false,
+          confirm: pick,
+          confirmState: 'pending',
+        });
+        return { ...s, messages: next };
+      });
+    } catch {
+      /* 恢复失败不影响正常对话 */
+    }
+  }, []);
+
   return {
     messages: state.messages,
     handoffCards: state.handoffCards,
@@ -353,6 +502,7 @@ export function useChatStream(userId: string, sessionId: string) {
     retryLast,
     stop,
     dismissClarify,
+    restorePending,
   };
 }
 

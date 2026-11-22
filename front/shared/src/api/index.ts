@@ -18,6 +18,7 @@ import type {
   AuthResponse,
   AuthUser,
   ConsultationStats,
+  ConfirmRequestData,
   ConsentItem,
   DataRequestItem,
   HealthProfile,
@@ -60,6 +61,14 @@ import type {
   TokenUsageGroup,
   UserSubscriptionItem,
   VitalMetric,
+  ClinicianAlertList,
+  ClinicianDecisionResult,
+  ClinicianPatientList,
+  ClinicianPendingList,
+  ClinicianScopeInfo,
+  HandoffQueue,
+  HandoffTicket,
+  HandoffSessionMessage,
 } from '../types';
 
 import { request, uploadForm } from './client';
@@ -115,9 +124,28 @@ export const appointmentApi = {
 
   get: (id: number) => request<{ appointment: Appointment }>(`/appointments/${id}`),
 
+  /**
+   * 可挂号医生目录：只返回"有档案 + 在岗 + 有 clinician 角色"的医生。
+   * 不传 department_id 就是全院在岗医生（患者端按科室自己筛）。
+   */
+  doctors: (params: { department_id?: number } = {}) =>
+    request<{
+      doctors: {
+        clinician_id: number;
+        name: string;
+        title: string;
+        specialty: string;
+        intro: string;
+        departments: { id: number; name: string; is_primary: boolean }[];
+      }[];
+      total: number;
+    }>('/appointments/doctors', { params }),
+
   create: (body: {
     department: string;
     doctor_name?: string;
+    /** 目录里选中的医生账号：带上它，确认后该医生才会自动成为你的接诊医生 */
+    doctor_clinician_id?: number;
     date?: string;
     time_slot?: string;
     fee?: number;
@@ -560,4 +588,298 @@ export const membershipAdminApi = {
     request<{ subscriptions: UserSubscriptionItem[]; total: number }>(
       '/admin/memberships/subscriptions',
     ),
+};
+
+// ── B2：高危动作确认（clinical_actions 状态机） ─────────────────────────
+// 后端在下发 confirm_request 卡片时只落了"待确认"草稿，号源未占用；
+// 用户点确认才走执行器落库。重复确认幂等返回原结果，不会建两条预约。
+
+export const clinicalActionApi = {
+  /** 当前账号待确认的动作（刷新页面后可恢复卡片） */
+  pending: () => request<{ items: ConfirmRequestData[] }>('/clinical-actions/pending'),
+
+  approve: (id: number) =>
+    request<{
+      status: string;
+      result_ref?: string | null;
+      action_type?: string;
+      data?: AppointmentData;
+    }>(`/clinical-actions/${id}/approve`, { method: 'POST' }),
+
+  reject: (id: number, reason = '患者拒绝') =>
+    request<{ status: string; reject_reason?: string | null }>(`/clinical-actions/${id}/reject`, {
+      method: 'POST',
+      body: { reason },
+    }),
+
+  /** 确认前改选医生（只改待确认草稿；doctor_clinician_id=0 表示改回待分配） */
+  retargetDoctor: (id: number, doctorClinicianId: number) =>
+    request<{ item: ConfirmRequestData }>(`/clinical-actions/${id}/appointment-doctor`, {
+      method: 'POST',
+      body: { doctor_clinician_id: doctorClinicianId },
+    }),
+};
+
+// ── C4：医护端（科室 / 责任患者授权） ─────────────────────────────────
+// 全部传 authResetOn403: false：这里的 403 是业务拒绝（如"该患者不在你的责任范围"），
+// 不该把医生踢下线；真正的凭证失效仍然是 401，由 client 统一处理。
+
+export const clinicianApi = {
+  scope: () =>
+    request<ClinicianScopeInfo>('/clinician/scope', { authResetOn403: false }),
+
+  patients: (params: { limit?: number } = {}) =>
+    request<ClinicianPatientList>('/clinician/patients', {
+      params,
+      authResetOn403: false,
+    }),
+
+  alerts: (params: { level?: string; min_level?: string; patient_id?: number; session_id?: string; limit?: number } = {}) =>
+    request<ClinicianAlertList>('/clinician/emergency-events', {
+      params,
+      authResetOn403: false,
+    }),
+
+  pending: (params: { limit?: number } = {}) =>
+    request<ClinicianPendingList>('/clinician/pending-actions', {
+      params,
+      authResetOn403: false,
+    }),
+
+  approve: (id: number) =>
+    request<ClinicianDecisionResult>(`/clinician/pending-actions/${id}/approve`, {
+      method: 'POST',
+      authResetOn403: false,
+    }),
+
+  reject: (id: number) =>
+    request<{ status: string; reject_reason?: string | null }>(
+      `/clinician/pending-actions/${id}/reject`,
+      { method: 'POST', authResetOn403: false },
+    ),
+};
+
+// ── 管理端：医护授权（C4） ──────────────────────────────────────────────
+// 把"授予 clinician 角色 / 绑科室 / 分责任患者"搬进界面。授权判定仍在后端
+// src/modules/clinician/scope.py，这里只是写关系，不做前端判断。
+
+export interface AdminClinicianDepartment {
+  id: number;
+  name: string;
+  is_primary: boolean;
+}
+
+export interface AdminClinicianPatient {
+  patient_id: number;
+  name: string;
+  relation: string;
+  granted_by: string;
+}
+
+export interface AdminClinicianProfile {
+  employee_no: string;
+  title: string;
+  specialty: string;
+  intro: string;
+  status: string;
+  note: string;
+}
+
+export interface AdminClinicianItem {
+  clinician_id: number;
+  name: string;
+  phone: string;
+  enabled: boolean;
+  roles: string[];
+  can_decide: boolean;
+  departments: AdminClinicianDepartment[];
+  patient_count: number;
+  granted_by: string;
+  /** 空对象 = 还没建档（无档案的医生不会出现在患者端可挂号目录里） */
+  profile: Partial<AdminClinicianProfile>;
+}
+
+export interface AdminClinicianDetail extends AdminClinicianItem {
+  patients: AdminClinicianPatient[];
+}
+
+/** 档案变更审计：谁在什么时候把哪些字段从什么改成什么 */
+export interface AdminAuditEntry {
+  id: number;
+  action: string;
+  actor: string;
+  actor_name: string;
+  before: Partial<AdminClinicianProfile>;
+  after: Partial<AdminClinicianProfile>;
+  changed: string[];
+  result: string;
+  note: string;
+  created_at: string;
+}
+
+export const adminClinicianApi = {
+  options: () =>
+    request<{ departments: { id: number; name: string }[] }>('/admin/clinicians/options'),
+
+  list: () =>
+    request<{ items: AdminClinicianItem[]; total: number }>('/admin/clinicians'),
+
+  get: (clinicianId: number) =>
+    request<AdminClinicianDetail>(`/admin/clinicians/${clinicianId}`),
+
+  /** 该医生的档案变更审计（新的在前） */
+  audit: (clinicianId: number, limit = 20) =>
+    request<{ items: AdminAuditEntry[]; total: number }>(
+      `/admin/clinicians/${clinicianId}/audit?limit=${limit}`,
+    ),
+
+  /** 医生档案：只传要改的字段；status 只接受 active / inactive */
+  updateProfile: (
+    clinicianId: number,
+    patch: Partial<Omit<AdminClinicianProfile, 'note'>> & { note?: string },
+  ) =>
+    request<{ clinician_id: number; profile: AdminClinicianProfile }>(
+      `/admin/clinicians/${clinicianId}/profile`,
+      { method: 'PUT', body: patch },
+    ),
+
+  grantRole: (clinicianId: number, note = '') =>
+    request<{ granted: boolean; roles: string[] }>(`/admin/clinicians/${clinicianId}/role`, {
+      method: 'POST',
+      body: { note },
+    }),
+
+  revokeRole: (clinicianId: number) =>
+    request<{ revoked: boolean; bindings_removed: { departments: number; patients: number } }>(
+      `/admin/clinicians/${clinicianId}/role`,
+      { method: 'DELETE' },
+    ),
+
+  bindDepartment: (clinicianId: number, departmentId: number, isPrimary = false) =>
+    request<{ department_id: number; name: string; is_primary: boolean }>(
+      `/admin/clinicians/${clinicianId}/departments`,
+      { method: 'POST', body: { department_id: departmentId, is_primary: isPrimary } },
+    ),
+
+  unbindDepartment: (clinicianId: number, departmentId: number) =>
+    request<{ removed: boolean }>(
+      `/admin/clinicians/${clinicianId}/departments/${departmentId}`,
+      { method: 'DELETE' },
+    ),
+
+  bindPatient: (clinicianId: number, patientId: number, relation = 'assigned') =>
+    request<{ patient_id: number; name: string; relation: string }>(
+      `/admin/clinicians/${clinicianId}/patients`,
+      { method: 'POST', body: { patient_id: patientId, relation } },
+    ),
+
+  unbindPatient: (clinicianId: number, patientId: number) =>
+    request<{ removed: boolean }>(
+      `/admin/clinicians/${clinicianId}/patients/${patientId}`,
+      { method: 'DELETE' },
+    ),
+};
+
+// ── C3：人工接管（坐席侧） ────────────────────────────────────────────────
+// 医护端「人工坐席」页用：队列 / 会话消息 / 认领 / 回复 / 结单。
+// 全部传 authResetOn403: false —— 403 是"你没有 handoff:write scope"这类业务拒绝，
+// 不该把医生踢下线（真正的凭证失效是 401）。
+
+export const handoffApi = {
+  queue: (params: { status?: string; mine?: boolean; only_active?: boolean; limit?: number } = {}) =>
+    request<HandoffQueue>('/handoff/queue', { params, authResetOn403: false }),
+  detail: (ticketId: number) =>
+    request<{ ticket: HandoffTicket }>(`/handoff/tickets/${ticketId}`, { authResetOn403: false }),
+
+  messages: (ticketId: number, limit = 30) =>
+    request<{ items: HandoffSessionMessage[]; total: number }>(
+      `/handoff/tickets/${ticketId}/messages`,
+      { params: { limit }, authResetOn403: false },
+    ),
+
+  claim: (ticketId: number) =>
+    request<{ ticket: HandoffTicket }>(`/handoff/tickets/${ticketId}/claim`, {
+      method: 'POST',
+      authResetOn403: false,
+    }),
+
+  reply: (ticketId: number, content: string) =>
+    request<{ ticket: HandoffTicket }>(`/handoff/tickets/${ticketId}/reply`, {
+      method: 'POST',
+      body: { content },
+      authResetOn403: false,
+    }),
+
+  resolve: (ticketId: number, resolution: string) =>
+    request<{ ticket: HandoffTicket; closing: string }>(
+      `/handoff/tickets/${ticketId}/resolve`,
+      { method: 'POST', body: { resolution }, authResetOn403: false, timeoutMs: 60_000 },
+    ),
+};
+
+// ── C3：人工接管（患者侧） ───────────────────────────────────────────────
+// 患者点「转人工」→ 建单；状态条读 mine；未认领时可撤回。
+// 403 同样按业务拒绝处理：游客/非本人不是凭证问题，不该被登出。
+
+export const patientHandoffApi = {
+  create: (body: {
+    session_id: string;
+    reason?: 'patient_request' | 'model_escalate' | 'emergency' | 'unclear';
+    priority?: string;
+    summary?: string;
+  }) =>
+    request<{ created: boolean; ticket: HandoffTicket }>('/handoff/tickets', {
+      method: 'POST',
+      body,
+      authResetOn403: false,
+    }),
+
+  /** 我的工单；session_id 只在当前会话里筛，active_only=false 可看历史 */
+  mine: (params: { session_id?: string; active_only?: boolean } = {}) =>
+    request<{ items: HandoffTicket[]; total: number }>('/handoff/tickets/mine', {
+      params,
+      authResetOn403: false,
+    }),
+
+  cancel: (ticketId: number) =>
+    request<{ ticket: HandoffTicket; closing: string }>(
+      `/handoff/tickets/${ticketId}/cancel`,
+      { method: 'POST', authResetOn403: false, timeoutMs: 60_000 },
+    ),
+};
+
+// ── 管理端：人工接管工单（只读） ──────────────────────────────────────────
+// 管理端只做审计：能看列表、详情、坐席和患者说了什么，不能认领/回复
+// （权限口径：坐席角色才带 handoff:write）。
+
+export const adminHandoffApi = {
+  tickets: (params: { status?: string; only_active?: boolean; limit?: number } = {}) =>
+    request<HandoffQueue>('/admin/handoff/tickets', { params }),
+
+  detail: (ticketId: number) =>
+    request<{ ticket: HandoffTicket }>(`/admin/handoff/tickets/${ticketId}`),
+
+  messages: (ticketId: number, limit = 30) =>
+    request<{ items: HandoffSessionMessage[]; total: number }>(
+      `/admin/handoff/tickets/${ticketId}/messages`,
+      { params: { limit } },
+    ),
+};
+
+// ── 管理端：租户（C1） ────────────────────────────────────────────────────
+// 管理员账号是全局的，工作租户由请求头 X-Tenant-Code 决定（见 shared client 的
+// setTenantReader）；这里只负责给「租户切换器」提供下拉数据。
+
+export interface TenantItem {
+  id: number;
+  code: string;
+  name: string;
+  status: 'active' | 'suspended' | string;
+  contact_name?: string | null;
+  contact_phone?: string | null;
+  created_at?: string | null;
+}
+
+export const adminTenantApi = {
+  list: () => request<{ tenants: TenantItem[]; total: number }>('/admin/tenants'),
 };

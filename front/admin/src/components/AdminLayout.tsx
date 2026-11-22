@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import {
@@ -6,20 +6,24 @@ import {
   BarChart3,
   BookOpen,
   Bot,
+  Building2,
   Coins,
   CreditCard,
   FileCode2,
+  Headset,
   LogOut,
   Menu,
   MessagesSquare,
   Route,
   Settings2,
   ShieldAlert,
+  Stethoscope,
   Users,
   X,
 } from 'lucide-react';
 import clsx from 'clsx';
 
+import { ADMIN_TENANT_KEY, adminTenantApi, getStoredTenant, type TenantItem } from '@his/shared';
 import { useAdminSession } from '../store/adminSession';
 
 const navGroups: { label: string; items: { to: string; label: string; icon: typeof Bot; end?: boolean }[] }[] = [
@@ -34,6 +38,8 @@ const navGroups: { label: string; items: { to: string; label: string; icon: type
     label: 'P0 核心管理',
     items: [
       { to: '/users', label: '用户管理', icon: Users },
+      { to: '/clinicians', label: '医护授权', icon: Stethoscope },
+      { to: '/handoff', label: '人工接管', icon: Headset },
       { to: '/agents', label: 'Agent 管理', icon: Bot },
       { to: '/prompts', label: 'Prompt 管理', icon: FileCode2 },
       { to: '/models', label: '模型管理', icon: Activity },
@@ -56,6 +62,36 @@ export function AdminLayout() {
   const { admin, logout } = useAdminSession();
   const navigate = useNavigate();
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [tenants, setTenants] = useState<TenantItem[]>([]);
+  const [tenantCode, setTenantCode] = useState(() => getStoredTenant() || 'default');
+
+  // 下拉数据只在布局挂载时取一次：租户清单变动频率极低（新医院入驻才变）
+  useEffect(() => {
+    let alive = true;
+    adminTenantApi
+      .list()
+      .then((r) => {
+        if (alive) setTenants(r.tenants);
+      })
+      .catch(() => {
+        /* 取不到就只显示当前 code，不阻塞其他页面 */
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const switchTenant = (code: string) => {
+    if (code === tenantCode) return;
+    localStorage.setItem(ADMIN_TENANT_KEY, code);
+    setTenantCode(code);
+    // 直接刷新：各页面的数据、缓存、已展开的详情都属于旧租户，局部重渲染容易残留
+    window.location.reload();
+  };
+
+  // 后端只允许超管跨租户（普通管理员带别的 X-Tenant-Code 会 403，
+  // 而 403 会触发前端登出，所以这里干脆不给普通管理员看切换器）
+  const canSwitchTenant = admin?.role === 'superadmin';
 
   const signOut = async () => {
     // 先让服务端撤销 token（logout 内部保证本地态一定被清理），再跳登录页
@@ -112,6 +148,31 @@ export function AdminLayout() {
           </div>
         ))}
       </nav>
+
+      {canSwitchTenant && (
+        <div className="border-t border-slate-100 px-4 pt-4">
+          <div className="rounded-lg bg-slate-50 p-2.5">
+            <div className="mb-1.5 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+              <Building2 className="h-3 w-3" />
+              工作租户
+            </div>
+            <select
+              value={tenantCode}
+              onChange={(e) => switchTenant(e.target.value)}
+              className="w-full rounded-md border border-slate-200 bg-white px-2 py-1.5 text-xs text-slate-700 outline-none focus:border-primary-400"
+              title="切换后所有管理接口按该租户过滤"
+            >
+              {(tenants.length ? tenants : [{ id: 1, code: tenantCode, name: tenantCode, status: 'active' }]).map(
+                (t) => (
+                  <option key={t.code} value={t.code} disabled={t.status !== 'active'}>
+                    {t.name}（{t.code}）{t.status !== 'active' ? ' · 已停用' : ''}
+                  </option>
+                ),
+              )}
+            </select>
+          </div>
+        </div>
+      )}
 
       <div className="border-t border-slate-100 px-4 py-4">
         <div className="flex items-center gap-2.5">

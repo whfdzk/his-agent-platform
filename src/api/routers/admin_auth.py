@@ -18,8 +18,11 @@ from pydantic import BaseModel, Field
 from src.api.deps import ADMIN_ROLE, get_current_admin
 from src.api.rate_limit import enforce_login_rate
 from src.core.exceptions import BizErrorCode, BizException
+from src.core.permissions import KIND_ADMIN
 from src.infra.database import get_db
 from src.modules.admin.model import Admin
+from src.modules.rbac import service as rbac
+from src.modules.tenant.model import DEFAULT_TENANT_ID
 from src.utils import token_revocation as revocation
 from src.utils.jwt_utils import encode_jwt, token_remaining_seconds, verify_jwt
 from sqlalchemy import select
@@ -37,13 +40,24 @@ def _serialize(a: Admin) -> dict:
     }
 
 
-def issue_admin_token(a: Admin) -> str:
-    """签发管理员 token。role 是管理端守卫的唯一依据，必须写进 payload。"""
+async def issue_admin_token(db: AsyncSession, a: Admin) -> str:
+    """签发管理员 token。
+
+    role 仍是管理端守卫的唯一依据（保持既有 payload.get("role") 判定），
+    roles/scopes 是本轮 RBAC 新增的细粒度依据：库里查不到角色时按 admin 默认兜底。
+    """
+    roles, role, scopes = await rbac.identity_of(db, KIND_ADMIN, a.id)
     return encode_jwt({
         "sub": str(a.id),
         "admin_id": a.id,
         "username": a.username,
-        "role": a.role or ADMIN_ROLE,
+        "kind": KIND_ADMIN,
+        "role": role or a.role or ADMIN_ROLE,
+        "roles": list(roles),
+        "scopes": sorted(scopes),
+        # C1：admins 表还没有 tenant_id（第二批迁移再补），管理员当前统一在默认租户，
+        # 先写 tid=1 让管理端接口有租户上下文可用，后续按平台级管理员跨租户再扩展。
+        "tid": DEFAULT_TENANT_ID,
     })
 
 
@@ -79,7 +93,11 @@ async def admin_login(
         logger.info(f"管理端登录失败（密码错误）: {req.username}")
         raise BizException(BizErrorCode.UNAUTHORIZED, "账号或密码错误", status_code=401)
 
-    return {"message": "登录成功", "token": issue_admin_token(admin), "admin": _serialize(admin)}
+    return {
+        "message": "登录成功",
+        "token": await issue_admin_token(db, admin),
+        "admin": _serialize(admin),
+    }
 
 
 class AdminLogoutRequest(BaseModel):

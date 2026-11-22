@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import uvicorn
 from fastapi import Depends, FastAPI
@@ -34,6 +35,7 @@ from src.middlewares.logging import LoggingMiddleware
 from src.core.exceptions import register_exception_handlers
 from src.core.logger import setup_logger
 from src.infra.database import engine
+from src.infra.embedding import get_embeddings
 from src.infra.redis_cache import get_redis_client, close_redis_pools
 from loguru import logger
 from src.api.routers.api import router as api_router
@@ -53,12 +55,19 @@ from src.api.routers.guide import router as guide_router
 from src.api.routers.observability import router as observability_router
 from src.api.routers.safety import router as safety_router
 from src.api.routers.admin_users import router as admin_users_router
+from src.api.routers.admin_tenants import router as admin_tenants_router
 from src.api.routers.admin_agents import router as admin_agents_router
 from src.api.routers.admin_prompts import router as admin_prompts_router
 from src.api.routers.admin_conversations import router as admin_conversations_router
 from src.api.routers.admin_system import router as admin_system_router
 from src.api.routers.admin_stats import router as admin_stats_router
 from src.api.routers.admin_membership import router as admin_membership_router
+from src.api.routers.admin_clinician import router as admin_clinician_router
+from src.api.routers.voice import router as voice_router
+from src.api.routers.clinical_actions import router as clinical_actions_router
+from src.api.routers.clinical_events import router as clinical_events_router
+from src.api.routers.clinician import router as clinician_router
+from src.api.routers.handoff import admin_router as admin_handoff_router, router as handoff_router
 
 
 
@@ -145,6 +154,20 @@ async def lifespan(app: FastAPI):
         await check_neo4j_health()
     except Exception as e:
         logger.error(f"neo4j 连接失败，图谱功能将无法使用：{e}")
+
+    # 预热 embedding：外部 embedding 服务首次 HTTPS 建连实测约 40s（后续 0.08s）。
+    # 放到后台 task 里跑，不阻塞启动；否则第一个走向量检索的请求（知识库检索、
+    # 体征解读、问诊长期记忆）会干等 40 秒。
+    async def _warmup_embedding() -> None:
+        try:
+            started = time.time()
+            emb = get_embeddings()
+            await emb.aembed_query("预热")
+            logger.info(f"Embedding 预热完成，耗时 {time.time() - started:.1f}s")
+        except Exception as e:
+            logger.warning(f"Embedding 预热失败（首次调用将较慢）: {type(e).__name__}: {e}")
+
+    app.state.embedding_warmup_task = asyncio.create_task(_warmup_embedding())
 
     # 启动批量持久化队列（消息/token_usage 落库）
     # 落库实现由 modules 层注入：core 只排队攒批，不反向依赖上层
@@ -251,12 +274,25 @@ def create_app() -> FastAPI:
     app.include_router(safety_router)
     # 管理端平台域：用户 / Agent / Prompt / 对话 / 系统配置 / 统计总览 / 会员（均带 admin 守卫）
     app.include_router(admin_users_router)
+    app.include_router(admin_tenants_router)
     app.include_router(admin_agents_router)
     app.include_router(admin_prompts_router)
     app.include_router(admin_conversations_router)
     app.include_router(admin_system_router)
     app.include_router(admin_stats_router)
     app.include_router(admin_membership_router)
+    # C4：管理端医护授权（角色 + 科室 + 责任患者）
+    app.include_router(admin_clinician_router)
+    app.include_router(voice_router)
+    # B2：高危动作确认（clinical_actions 状态机）
+    app.include_router(clinical_actions_router)
+    # B3：急症分级事件（clinical_events）
+    app.include_router(clinical_events_router)
+    # C4：医护端（clinician 授权范围下的只读视图 + 代批）
+    app.include_router(clinician_router)
+    # C3：人工接管（工单申请 / 坐席认领回复 / 管理端只读）
+    app.include_router(handoff_router)
+    app.include_router(admin_handoff_router)
 
 
     return app
@@ -265,7 +301,14 @@ def create_app() -> FastAPI:
 app = create_app()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=8000,
+        limit_concurrency=100,      # 最大并发请求数，超过则排队
+        backlog=200,                # 排队队列长度
+        timeout_keep_alive=5,       # Keep-Alive 超时
+    )
 # 健康检查路由； 能访问通，就代表应用启动
 @app.get("/health")
 async def root():
@@ -273,9 +316,29 @@ async def root():
     return {"status": "ok"}
 
 
+@app.get("/health/pool")
+async def health_pool():
+    """查看数据库连接池状态"""
+    pool = engine.pool
+    return {
+        "database_pool": {
+            "pool_size": pool.size(),
+            "checked_in": pool.checkedin(),
+            "checked_out": pool.checkedout(),
+            "overflow": pool.overflow(),
+            "total": pool.size() + pool.overflow(),
+        }
+    }
+
+
 @app.get("/health/deps")
-async def health_deps(milvus_alias: str = Depends(get_milvus_dependency)):
-    """检查核心依赖可用性（PostgreSQL / Redis / RustFS / Milvus / Neo4j）。并发检查，P95 < 200ms。"""
+async def health_deps():
+    """检查核心依赖可用性（PostgreSQL / Redis / RustFS / Milvus / Neo4j）。并发检查，P95 < 200ms。
+
+    注意：不要在 Depends 层注入 Milvus 连接——connections.connect 是同步阻塞调用，
+    依赖注入发生在进入端点之前，Milvus 不可用时会直接把整个健康检查拖死（500 或长挂起）。
+    这里改为在端点内部用线程池 + 超时探测，保证任何一个依赖异常都不影响整体返回。
+    """
     settings = get_settings()
 
     async def check_postgres():
@@ -304,20 +367,18 @@ async def health_deps(milvus_alias: str = Depends(get_milvus_dependency)):
 
     async def check_milvus():
         try:
-            if not milvus_alias:
-                raise RuntimeError("milvus alias is empty")
-            await to_thread(check_milvus_health)
+            await asyncio.wait_for(to_thread(check_milvus_health), timeout=5.0)
             return {"ok": True, "error": ""}
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     async def check_neo4j():
         try:
             neo4j_driver = get_neo4j_driver()
-            await neo4j_driver.verify_connectivity()
+            await asyncio.wait_for(neo4j_driver.verify_connectivity(), timeout=5.0)
             return {"ok": True, "error": ""}
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     # 并发检查 5 个依赖
     results = await asyncio.gather(

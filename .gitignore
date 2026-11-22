@@ -166,3 +166,16 @@ _*.ts
 logs/
 *.log
 *.log.gz
+
+# --- 2026-11-22 目录整理：本地运行产物与数据缓存 ---
+_msdata/
+backups/
+tools/probes/out/
+tools/probes/assets/
+*.wav
+
+# --- 2026-11-22 提交前：本地文档/个人材料/工具缓存不入库 ---
+doc/
+.codebuddy/
+.jbeval/
+.workbuddy/

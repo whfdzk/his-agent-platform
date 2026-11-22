@@ -1,0 +1,30 @@
+{
+  "meta": {
+    "name": "knowledge_docs 检索基线集 v1",
+    "built_at": "2026-11-17",
+    "corpus": "knowledge_docs（9 篇文档 / 13 个 chunk）",
+    "note": "query 为口语化改写，不照抄原文；gold 用 doc_name + chunk_index 精确到切片"
+  },
+  "cases": [
+    {"id": "q01", "query": "二甲双胍一次吃几片，一天最多能吃多少", "gold": [{"doc_name": "二甲双胍缓释片说明书", "chunk_index": 0}]},
+    {"id": "q02", "query": "吃二甲双胍会不会拉肚子、嘴里有金属味", "gold": [{"doc_name": "二甲双胍缓释片说明书", "chunk_index": 0}]},
+    {"id": "q03", "query": "肾功能不全的人能不能吃二甲双胍", "gold": [{"doc_name": "二甲双胍缓释片说明书", "chunk_index": 0}]},
+    {"id": "q04", "query": "奥美拉唑治胃溃疡怎么吃，能嚼碎吗", "gold": [{"doc_name": "奥美拉唑肠溶胶囊说明书", "chunk_index": 0}]},
+    {"id": "q05", "query": "布洛芬能退烧吗，成人一次吃几粒", "gold": [{"doc_name": "布洛芬缓释胶囊说明书", "chunk_index": 0}]},
+    {"id": "q06", "query": "感冒引起头痛鼻塞流鼻涕吃什么药", "gold": [{"doc_name": "感冒灵颗粒说明书", "chunk_index": 0}]},
+    {"id": "q07", "query": "氯雷他定对过敏性鼻炎打喷嚏有用吗", "gold": [{"doc_name": "氯雷他定片说明书", "chunk_index": 0}]},
+    {"id": "q08", "query": "硝苯地平缓释片的初始剂量是多少", "gold": [{"doc_name": "硝苯地平缓释片说明书", "chunk_index": 0}]},
+    {"id": "q09", "query": "缺乏维生素C怎么补，一天吃几片", "gold": [{"doc_name": "维生素C片说明书", "chunk_index": 0}]},
+    {"id": "q10", "query": "阿莫西林一天最多吃多少，青霉素过敏能吃吗", "gold": [{"doc_name": "阿莫西林胶囊说明书", "chunk_index": 0}]},
+    {"id": "q11", "query": "血压多少算高血压，家里自己量用什么标准", "gold": [{"doc_name": "高血压诊疗指南2024.txt", "chunk_index": 0}]},
+    {"id": "q12", "query": "高血压的危险分层怎么分，很高危是什么意思", "gold": [{"doc_name": "高血压诊疗指南2024.txt", "chunk_index": 0}]},
+    {"id": "q13", "query": "高血压病人每天盐摄入要控制在多少克", "gold": [{"doc_name": "高血压诊疗指南2024.txt", "chunk_index": 1}]},
+    {"id": "q14", "query": "中危高血压要不要马上开始吃药", "gold": [{"doc_name": "高血压诊疗指南2024.txt", "chunk_index": 1}]},
+    {"id": "q15", "query": "降压药有哪几大类，ACEI 适合哪些病人", "gold": [{"doc_name": "高血压诊疗指南2024.txt", "chunk_index": 2}]},
+    {"id": "q16", "query": "ACEI 吃了干咳怎么办，可以换成什么药", "gold": [{"doc_name": "高血压诊疗指南2024.txt", "chunk_index": 2}]},
+    {"id": "q17", "query": "血压 160/100 需要一开始就两种药一起吃吗", "gold": [{"doc_name": "高血压诊疗指南2024.txt", "chunk_index": 3}]},
+    {"id": "q18", "query": "哮喘病人能不能用 β 受体阻滞剂降压", "gold": [{"doc_name": "高血压诊疗指南2024.txt", "chunk_index": 3}]},
+    {"id": "q19", "query": "孕妇血压高首选什么降压药，哪些药不能用", "gold": [{"doc_name": "高血压诊疗指南2024.txt", "chunk_index": 4}]},
+    {"id": "q20", "query": "高血压控制达标后多久复查一次", "gold": [{"doc_name": "高血压诊疗指南2024.txt", "chunk_index": 4}]}
+  ]
+}

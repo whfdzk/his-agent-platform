@@ -20,9 +20,13 @@ KNOWLEDGE_SYSTEM_PROMPT = """你是平台医疗的统一医学知识服务助手
 - 问题涉及临床指南、药品说明书、医院制度 SOP、文献：调用 search_knowledge_docs
   （doc_type 可传 guideline/drug_instruction/sop/literature/disease/lab_indicator/department 做过滤）
 - 问题涉及疾病与症状/药物/科室/检查/食物的关系、多跳推理：调用 search_knowledge_graph
-- 复杂问题需要同时参考指南和实体关系（如"糖尿病合并肾功能不全怎么选药"）：调用 search_knowledge_multi
+- **复杂临床问题**（要同时看指南条款 + 用药/共病/禁忌，或一句话里有多个条件，如
+  "糖尿病肾病合并高血压怎么选药""ACEI 干咳能换什么""肌酐高能不能用 ARB"）：
+  调用 search_knowledge_agentic —— 它会自己判断要不要检索、走哪条通道，
+  证据不足时自动改写检索式再查一轮，比自己拼两三次工具更省时间
+- 问题同时需要指南和图谱的并列对照、且结构简单：调用 search_knowledge_multi
 - 用户问"这些说法出自哪里""知识库里有哪些指南/说明书""是不是最新版"：调用 list_knowledge_sources
-- 每个问题**只调用一个最合适的工具**，不要为了"更全面"连续调用多个（每次检索都很慢）；只有明确需要同时看指南和图谱时才用 multi
+- 简单单点问题**只调用一个工具**，不要为了"更全面"连续调用多个（每次检索都很慢）
 - 至少调用一次工具，不要凭记忆直接回答
 - 工具返回"未找到/暂时不可用/降级"时：如实说明知识库暂未覆盖，只用通用医学常识给出方向性建议，禁止编造指南条款、文献标题或数据
 - 工具返回里带【依据核查】标注的，说明该部分缺文档支撑，回答时要保留这个提示
@@ -44,6 +48,7 @@ _DEFAULT_TOOL_IDS = (
     "search_knowledge_graph",
     "search_knowledge_sql",
     "search_knowledge_multi",
+    "search_knowledge_agentic",
     "review_prescription_tool",
     "list_knowledge_sources",
 )

@@ -23,10 +23,10 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
-from src.core.base_model import BaseModel
+from src.core.base_model import BaseModel, TenantMixin
 
 
-class AgentTrace(BaseModel):
+class AgentTrace(BaseModel, TenantMixin):
     """一轮执行的聚合轨迹（trace 粒度）。"""
 
     __tablename__ = "agent_traces"
@@ -71,10 +71,11 @@ class AgentTrace(BaseModel):
         Index("ix_agent_traces_user_time", "user_id", "created_at"),
         Index("ix_agent_traces_session", "session_id"),
         Index("ix_agent_traces_created", "created_at"),
+        Index("ix_agent_traces_tenant", "tenant_id"),
     )
 
 
-class AgentSpan(BaseModel):
+class AgentSpan(BaseModel, TenantMixin):
     """链路节点明细。attributes 只放白名单字段，文本必须先脱敏。"""
 
     __tablename__ = "agent_spans"
@@ -102,10 +103,11 @@ class AgentSpan(BaseModel):
     __table_args__ = (
         Index("ix_agent_spans_trace", "trace_id", "id"),
         Index("ix_agent_spans_created", "created_at"),
+        Index("ix_agent_spans_tenant", "tenant_id"),
     )
 
 
-class SafetyEvent(BaseModel):
+class SafetyEvent(BaseModel, TenantMixin):
     """Safety Engine 安全事件：命中危险信号或输出违规时落库，支持人工复核。"""
 
     __tablename__ = "safety_events"
@@ -139,4 +141,5 @@ class SafetyEvent(BaseModel):
         Index("ix_safety_events_created", "created_at"),
         Index("ix_safety_events_review", "review_status", "created_at"),
         Index("ix_safety_events_user", "user_id", "created_at"),
+        Index("ix_safety_events_tenant", "tenant_id"),
     )

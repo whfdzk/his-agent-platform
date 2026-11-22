@@ -29,6 +29,14 @@ CUTOFF_KEY_PREFIX = "auth:revoked:at:"
 # Redis 故障后的熔断时长（秒）：期间不再尝试连接，直接按"不可用"处理
 _UNAVAILABLE_COOLDOWN_SECONDS = 15.0
 
+# 内存缓存时长（秒）：同一个 token 在缓存期内不会重复查 Redis
+# 高并发下大幅减少 Redis 查询次数，代价是登出后最多 5 秒内 token 仍有效
+_CACHE_TTL_SECONDS = 5.0
+
+# 内存缓存：key -> (value, expire_at)
+_jti_cache: dict[str, tuple[bool, float]] = {}
+_session_cache: dict[str, tuple[bool, float]] = {}
+
 # 独立的短超时连接池：鉴权链路不能被 Redis 慢请求拖住
 _POOL_KWARGS = dict(
     max_connections=50,
@@ -100,13 +108,26 @@ async def revoke_jti(jti: str, ttl_seconds: int) -> bool:
 
 
 async def is_jti_revoked(jti: str) -> bool | None:
-    """token 是否已被撤销；Redis 不可用返回 None。"""
+    """token 是否已被撤销；Redis 不可用返回 None。带 5 秒内存缓存。"""
     if not jti:
         return False
     if _in_cooldown():
         return None
+
+    # 先查内存缓存
+    cached = _jti_cache.get(jti)
+    if cached is not None:
+        value, expire_at = cached
+        if time.monotonic() < expire_at:
+            return value
+        else:
+            del _jti_cache[jti]
+
     try:
-        return bool(await _get_client().exists(_jti_key(jti)))
+        result = bool(await _get_client().exists(_jti_key(jti)))
+        # 写入缓存
+        _jti_cache[jti] = (result, time.monotonic() + _CACHE_TTL_SECONDS)
+        return result
     except Exception as e:
         _mark_unavailable(e)
         return None
@@ -137,19 +158,35 @@ async def revoke_session_before(scope: str, subject: str, cutoff: float) -> bool
 
 
 async def is_session_revoked(scope: str, subject: str, issued_at: float | None) -> bool | None:
-    """签发时间早于账号失效时间点 → 已撤销；Redis 不可用返回 None。"""
+    """签发时间早于账号失效时间点 → 已撤销；Redis 不可用返回 None。带 5 秒内存缓存。"""
     if not subject or issued_at is None:
         return False
     if _in_cooldown():
         return None
+
+    # 先查内存缓存（缓存 key 包含 issued_at，因为不同签发时间的判断结果不同）
+    cache_key = f"{scope}:{subject}:{int(issued_at)}"
+    cached = _session_cache.get(cache_key)
+    if cached is not None:
+        value, expire_at = cached
+        if time.monotonic() < expire_at:
+            return value
+        else:
+            del _session_cache[cache_key]
+
     try:
         raw = await _get_client().get(_cutoff_key(scope, subject))
     except Exception as e:
         _mark_unavailable(e)
         return None
     if raw is None:
-        return False
-    try:
-        return issued_at <= float(raw)
-    except (TypeError, ValueError):
-        return False
+        result = False
+    else:
+        try:
+            result = issued_at <= float(raw)
+        except (TypeError, ValueError):
+            result = False
+
+    # 写入缓存
+    _session_cache[cache_key] = (result, time.monotonic() + _CACHE_TTL_SECONDS)
+    return result
