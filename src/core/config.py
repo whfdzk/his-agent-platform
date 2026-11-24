@@ -78,13 +78,15 @@ class Settings(BaseSettings):
     # 模型
     OPENAI_API_KEY: str = ""
     DASHSCOPE_API_KEY: str = ""
-    EMBEDDING_API_KEY: str = ""  # SiliconFlow（硅基流动），用于 Qwen3 embedding
+    EMBEDDING_API_KEY: str = ""  # SiliconFlow（硅基流动），用于 bge embedding
        # 聊天模型
     BASE_URL_CHAT: str = ""
     DEEPSEEK_API_KEY: str = ""
     DEEPSEEK_MODEL: str = "deepseek-chat"
     CHAT_MODEL: str = "deepseek-chat"
-    EMBEDDING_MODEL: str = "Qwen/Qwen3-Embedding-0.6B"
+    # 与 Milvus 集合 knowledge_docs 的入库向量保持一致：换模型必须整库重灌，
+    # 否则查询向量和库内向量不在同一空间，检索会静默失真且不报错。
+    EMBEDDING_MODEL: str = "BAAI/bge-large-zh-v1.5"
     # 向量服务地址：此前硬编码在 3 个业务模块 + 3 个脚本里，换供应商要改 6 处
     EMBEDDING_BASE_URL: str = "https://api.siliconflow.cn/v1"
     RERANK_MODEL: str = "qwen3.7-text-rerank"

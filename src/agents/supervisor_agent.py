@@ -157,7 +157,7 @@ async def _get_long_term_store():
             lambda: MilvusStore(
                 alias=milvus_alias,
                 embeddings=get_embeddings(),
-                dims=1024,  # Qwen3-Embedding 输出 1024 维
+                dims=1024,  # bge-large-zh-v1.5 输出 1024 维，与入库向量对齐
             )
         )
         _milvus_retry_at = 0.0

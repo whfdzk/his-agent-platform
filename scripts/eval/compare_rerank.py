@@ -67,7 +67,7 @@ async def siliconflow_rerank(query: str, docs: list[dict], top_k: int, model: st
 
 async def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--collection", default="knowledge_docs_qwen")
+    ap.add_argument("--collection", default="knowledge_docs")
     ap.add_argument("--pool", type=int, default=30)
     ap.add_argument("--top-k", type=int, default=5)
     args = ap.parse_args()
