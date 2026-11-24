@@ -87,7 +87,7 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "Qwen/Qwen3-Embedding-0.6B"
     # 向量服务地址：此前硬编码在 3 个业务模块 + 3 个脚本里，换供应商要改 6 处
     EMBEDDING_BASE_URL: str = "https://api.siliconflow.cn/v1"
-    RERANK_MODEL: str = "qwen3-rerank"
+    RERANK_MODEL: str = "qwen3.7-text-rerank"
     VL_MODEL: str = "Qwen/Qwen3-VL-32B-Instruct"
     # 图片报告 OCR 兜底：MinerU 未部署时用视觉模型把图片报告转录成文本。
     # 此前 VL_MODEL 只定义未接线，jpg/png 报告在 MinerU 不可用时拿到空文本，
@@ -151,9 +151,14 @@ class Settings(BaseSettings):
     BM25_TOP_K: int = 20               # BM25 单路召回条数
     BM25_WEIGHT: float = 1.0           # RRF 里的通道权重，想让向量占主导就调小
     BM25_MAX_INDEX_DOCS: int = 2000    # 超过这个 chunk 数就不建内存索引，退回纯向量
-    BM25_INDEX_TTL_SECONDS: float = 300.0  # 索引有效期，知识库增删后靠它自动重建
+    BM25_INDEX_TTL_SECONDS: float = 3600.0  # 索引有效期兜底；增删时 ingest 会调 invalidate()，不需要靠短 TTL 兜
     GRAPH_RAG_RECORD_LIMIT: int = 20   # 图谱 RAG 单条 Cypher 取回上限
     NL2SQL_MAX_RETRIES: int = 2        # SQL 重试次数
+
+    # 检索结果缓存：同一问题在一轮里会被多个 agent/工具重复检索，
+    # 跨轮也会重复问；文档与图谱内容都是知识库（非患者数据），可安全缓存。
+    KB_QUERY_CACHE_TTL_SECONDS: float = 600.0
+    KB_QUERY_CACHE_MAX_ENTRIES: int = 256
     NL2SQL_TIMEOUT_SECONDS: int = 10   # 单条 SQL 执行超时（秒）
     NL2SQL_ROW_LIMIT: int = 100        # SQL 返回行数上限
     FUSION_SNIPPET_LIMIT: int = 1000   # 融合阶段每条通道送入证据的截断长度
@@ -196,6 +201,13 @@ class Settings(BaseSettings):
 
     # 可观测
     SENTRY_DSN: str = ""  # 为空则不启用 Sentry
+
+    # Langfuse（自托管链路观测）。SECRET_KEY 为空或 ENABLED=false 时整层 no-op
+    LANGFUSE_ENABLED: bool = False
+    LANGFUSE_PUBLIC_KEY: str = ""
+    LANGFUSE_SECRET_KEY: str = ""
+    LANGFUSE_BASE_URL: str = "http://localhost:3000"
+    LANGFUSE_ENVIRONMENT: str = "dev"
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -425,16 +437,41 @@ class FallbackChatModel(ChatOpenAI):
         raise last  # type: ignore[misc]
 
 
+def _thinking_extra_body(
+    model: str, base_url: str | None, thinking: bool,
+) -> dict | None:
+    """关闭千问系模型的思考模式。
+
+    只对 DashScope 兼容网关 / qwen 模型名下这个字段：别的 OpenAI 兼容网关
+    不认 enable_thinking，乱传可能整条请求被拒。实测同一实体提取提示：
+    思考开 2.6s / 120 输出 token，关掉 0.9s / 41 token。
+    """
+    if thinking:
+        return None
+    target = f"{model} {base_url or ''}".lower()
+    if "qwen" in target or "dashscope" in target:
+        return {"enable_thinking": False}
+    return None
+
+
 @lru_cache(maxsize=64)
-def get_llm(temperature: float = 0.7, model: str | None = None) -> ChatOpenAI:
+def get_llm(
+    temperature: float = 0.7,
+    model: str | None = None,
+    thinking: bool = True,
+    max_tokens: int | None = None,
+) -> ChatOpenAI:
     """获取 OpenAI 兼容的聊天模型客户端（DeepSeek / 通义 / 自建网关均可）。
 
     返回的是 FallbackChatModel：默认走 .env 的主模型，失败时按管理端配置的
     候选链（model_configs 里 model_type=chat、按 priority 排序）自动切换。
 
-    按 (temperature, model) 缓存复用：客户端本身无状态，重复构造只是浪费对象，
-    真正的连接池由 _bypass_proxy_http_clients() 统一持有。
+    按 (temperature, model, thinking, max_tokens) 缓存复用：客户端本身无状态，
+    重复构造只是浪费对象，真正的连接池由 _bypass_proxy_http_clients() 统一持有。
 
+    - thinking=False 给"抽取/改写/打分/核查"这类工具调用用：不需要推理，
+      开着思考会多花 2~3 倍输出 token 和数倍延迟
+    - max_tokens 给工具调用封顶，避免模型把打分结果写成小作文
     - api_key 按优先级取 DEEPSEEK_API_KEY / OPENAI_API_KEY / DASHSCOPE_API_KEY，缺失时启动即报错
     - base_url 优先用 BASE_URL_CHAT（自建网关），并容忍误配成完整 /chat/completions 地址
     - 显式传入 api_key / base_url / 超时 / 重试，不依赖进程环境变量的隐式推断
@@ -443,12 +480,15 @@ def get_llm(temperature: float = 0.7, model: str | None = None) -> ChatOpenAI:
     s = get_settings()
     api_key, base_url = _resolve_chat_credentials()
     sync_client, async_client = _bypass_proxy_http_clients()
+    model_name = model or s.CHAT_MODEL
 
     return FallbackChatModel(
-        model=model or s.CHAT_MODEL,
+        model=model_name,
         api_key=api_key,
         base_url=base_url or None,
         temperature=temperature,
+        max_tokens=max_tokens,
+        extra_body=_thinking_extra_body(model_name, base_url, thinking),
         timeout=s.LLM_TIMEOUT,
         max_retries=s.LLM_MAX_RETRIES,
         stream_usage=s.LLM_STREAM_USAGE,
