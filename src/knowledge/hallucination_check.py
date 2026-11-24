@@ -2,6 +2,11 @@
 幻觉检查加强版：校验回答是否基于检索结果，不一致时自动降级。
 借鉴 ai-commerce-interview 的实现。
 
+【已废弃 · 2026-11-24】本模块连同 src/knowledge/prompts.py 里的
+DOC_QA_PROMPT / GRAPH_QA_PROMPT / HALLUCINATION_CHECK_PROMPT 全仓无调用方：
+知识问答已改成 agentic 检索 + citation 结构化（doc_rag.py），
+输出侧风险由 safety engine 兜底。保留作历史参考，确认后可整体删除。
+
 为什么需要加强幻觉检查：
 - 医疗场景对准确性要求极高，幻觉可能导致严重后果
 - 现有的检查失败时默认返回 True（可信），这是不安全的
