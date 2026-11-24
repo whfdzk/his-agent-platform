@@ -35,7 +35,7 @@ jobs:
           python scripts/eval/pf_run.py --split core --only safety --tag ci-dry --dry-run
           python scripts/eval/pf_run.py --split core --only kb,drug --sample 3 --tag ci-dry --dry-run
       - name: 评测脚本离线自测（MockTransport，不发真实请求）
-        run: python tools/verify/_verify_eval_offline.py
+        run: python tools/verify/verify_eval_offline.py
 
   # 在线部分：需要 self-hosted runner（起后端 + PostgreSQL/Redis/Milvus/Neo4j）
   # 没有 EVAL_BASE_URL 时自动跳过，不阻塞主干
