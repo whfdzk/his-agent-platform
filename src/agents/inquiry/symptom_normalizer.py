@@ -11,6 +11,9 @@ from langchain_core.embeddings import Embeddings
 from neo4j import AsyncDriver
 from pymilvus import MilvusClient
 
+# 症状语义索引集合名；集合不存在时 semantic_match_symptoms 直接降级，不逐条报错
+SYMPTOM_COLLECTION = "symptom_index"
+
 # ── 第一层：结构化输出模型 ────────────────────────────────────────────────
 class SymptomsOutput(BaseModel):
     """LLM 结构化输出的 Schema。with_structured_output 会强制 LLM 按此格式返回。"""
@@ -105,6 +108,18 @@ async def semantic_match_symptoms(
     """
     if not unmatched_symptoms:
         return {}, []
+    # 集合缺失时直接降级：pymilvus 每次 search 都会在日志里打一条带 traceback 的 ERROR，
+    # 明明已 try/except 兜住，看起来却像服务异常（实测排查时误导过一次）
+    try:
+        if not milvus_client.has_collection(SYMPTOM_COLLECTION):
+            logger.warning(
+                "symptom_index 集合不存在，跳过症状语义兜底；需要时执行 "
+                "python -m src.scripts.init_symptom_index 重建"
+            )
+            return {}, list(unmatched_symptoms)
+    except Exception as e:  # 探活失败不阻断主流程
+        logger.warning("symptom_index 探活失败，跳过语义兜底: {}", e)
+        return {}, list(unmatched_symptoms)
     # 批量向量化，减少 API 调用次数
     query_embeddings = await embedding_model.aembed_documents(unmatched_symptoms)
     mapped: dict[str, str] = {}
@@ -112,7 +127,7 @@ async def semantic_match_symptoms(
     for symptom, query_vec in zip(unmatched_symptoms, query_embeddings):
         try:
             results = milvus_client.search(
-                collection_name="symptom_index",
+                collection_name=SYMPTOM_COLLECTION,
                 data=[query_vec],
                 limit=1,
                 output_fields=["name"],
