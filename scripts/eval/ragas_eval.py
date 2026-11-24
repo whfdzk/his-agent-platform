@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
 import warnings
 from datetime import datetime
@@ -33,6 +34,96 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+
+# 送评前要剔掉的"非事实句"：这些句子本来就不来自检索，留着只会把 faithfulness 分母撑大。
+# 注意"建议"本身不能当丢弃词——"建议挂心内科门诊"是结论，必须留。
+_BOILERPLATE_PATTERNS = [
+    re.compile(r"(尽快|立即|马上).{0,8}(就医|就诊|急诊|拨打\s*120|前往)"),
+    re.compile(r"急诊科|拨打\s*120|呼叫\s*120|不要拖"),
+    re.compile(r"需要我帮您|帮您挂号|告诉我(日期|时间)|复诊|随访"),
+    re.compile(r"携带.{0,8}报告"),
+    re.compile(r"请问|能不能|可以请您|有的话|麻烦告诉我|想(进一步)?了解您"),
+    re.compile(r"匹配度|智能?问诊助手|基于(现有|目前)的信息|暂时无法|信息(有限|不足)"),
+    re.compile(r"建议(今天|明天|尽快)|仅供参考|不能替代|以医生为准"),
+]
+
+
+def _split_sentences(text: str) -> list[str]:
+    """按段落和句末标点切句，保留句子本身（不保留分隔符）。"""
+    parts: list[str] = []
+    for line in text.splitlines():
+        line = line.strip().lstrip("*#>- ").strip()
+        if not line:
+            continue
+        for seg in re.split(r"(?<=[。！？；!?;])", line):
+            seg = seg.strip()
+            if seg:
+                parts.append(seg)
+    return parts
+
+
+def _facts_only(answer: str) -> tuple[str, dict]:
+    """只留事实性陈述，剔掉安全话术/追问/元话术/免责声明。
+
+    返回 (送评文本, 统计)。统计里 kept/total/ratio 必须写进报告——
+    过滤比过低说明答案里几乎没有事实句，这种样本的分数不能直接比。
+    """
+    sentences = _split_sentences(answer or "")
+    total = len(sentences)
+    kept = [s for s in sentences if not any(p.search(s) for p in _BOILERPLATE_PATTERNS)]
+    ratio = round(len(kept) / total, 3) if total else 0.0
+    if not kept:
+        # 全被过滤掉说明这条答案里压根没有事实句，退回原文并在报告里标出，避免"过滤成空"抬高分数
+        return answer, {"kept": 0, "total": total, "ratio": 0.0, "no_facts": True}
+    return "".join(kept), {"kept": len(kept), "total": total, "ratio": ratio, "no_facts": False}
+
+
+def _drug_core_name(name: str) -> str:
+    """把"布洛芬缓释胶囊"剥成"布洛芬"，用于在问题里认出药名。"""
+    core = re.sub(r"(肠溶|缓释|控释|分散|咀嚼|泡腾)?(胶囊|片|颗粒|口服液|注射液|软膏|乳膏|滴眼液|喷雾剂|糖浆|栓)", "", name or "")
+    return core.strip()
+
+
+async def _pg_drug_contexts(question: str) -> list[str]:
+    """drug 片补 PG 说明书正文。
+
+    真实回答里的适应证/用法用量/禁忌来自 PG 的 medication_tools（drugs + drug_details），
+    而 doc_rag 检索只覆盖 Milvus 的 drug_instruction chunk。不把说明书拼进来，
+    ragas 就会拿"另一份材料"去判忠实度和召回，分数天然低且不可比。
+    """
+    import asyncpg  # noqa: PLC0415
+
+    from src.core.config import get_settings  # noqa: PLC0415
+
+    s = get_settings()
+    # DATABASE_URL 是 SQLAlchemy 口径（postgresql+asyncpg://），asyncpg.connect 要纯 postgresql://
+    dsn = s.DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+    try:
+        conn = await asyncpg.connect(dsn, timeout=10)
+    except Exception as e:  # noqa: BLE001 —— 连不上就返回空，不让评测整体失败
+        print(f"  [PG] 连接失败，drug 片不补说明书：{type(e).__name__}: {e}")
+        return []
+    try:
+        rows = await conn.fetch(
+            "SELECT d.name, d.alias, dd.full_instruction "
+            "FROM drugs d JOIN drug_details dd ON dd.drug_id = d.id "
+            "WHERE dd.full_instruction IS NOT NULL AND length(dd.full_instruction) > 20"
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"  [PG] 查说明书失败：{type(e).__name__}: {e}")
+        return []
+    finally:
+        await conn.close()
+
+    hits: list[str] = []
+    for r in rows:
+        name = r["name"] or ""
+        core = _drug_core_name(name)
+        if len(core) >= 2 and (core in question or name in question):
+            text = (r["full_instruction"] or "").strip()
+            if text:
+                hits.append(text[:2200])  # 与 CHANNEL_SNIPPET_LIMIT 对齐，模型看到的就这么多
+    return hits
 
 
 def read_env() -> dict:
@@ -109,6 +200,7 @@ async def main_async(args) -> None:
     ids = {i.strip() for i in args.ids.split(",") if i.strip()} if args.ids else None
 
     rows = []
+    fact_stats: dict[str, dict] = {}
     for r in report.get("results", []):
         if slices and r.get("slice") not in slices:
             continue
@@ -125,15 +217,23 @@ async def main_async(args) -> None:
         except Exception as e:  # 检索失败就跳过这条，不污染均值
             print(f"  {r['id']:<10} 检索失败，跳过：{type(e).__name__}: {e}", flush=True)
             continue
+        if r.get("slice") == "drug":
+            # 说明书正文在 PG 不在 Milvus：不补进来，忠实度和召回评的都是另一份材料
+            pg_ctx = await _pg_drug_contexts(question)
+            if pg_ctx:
+                print(f"  {r['id']:<10} 追加 PG 说明书 {len(pg_ctx)} 段", flush=True)
+                contexts = pg_ctx + contexts
         if not contexts:
             print(f"  {r['id']:<10} 检索空结果，跳过", flush=True)
             continue
+        resp_eval, fact_stat = _facts_only(r["answer"])
+        fact_stats[r["id"]] = fact_stat
         rows.append(
             {
                 "id": r["id"],
                 "slice": r.get("slice"),
                 "user_input": question,
-                "response": r["answer"],
+                "response": resp_eval,
                 "retrieved_contexts": contexts[: args.max_contexts],
                 "reference": refs.get(r["id"], ""),
             }
@@ -208,6 +308,11 @@ async def main_async(args) -> None:
         rec = scores.get(x["user_input"], {})
         row = {"id": x["id"], "slice": x["slice"], "contexts": len(x["retrieved_contexts"]),
                "has_reference": bool(x["reference"])}
+        fs = fact_stats.get(x["id"]) or {}
+        row["fact_ratio"] = fs.get("ratio")
+        row["facts_kept"] = fs.get("kept")
+        row["facts_total"] = fs.get("total")
+        row["no_facts"] = fs.get("no_facts", False)
         for k in metric_keys:
             if k in rec:
                 row[k] = None if rec[k] is None else round(rec[k], 3)
