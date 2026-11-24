@@ -36,7 +36,7 @@ def test_tokens_carry_jti_and_short_ttl():
 
 
 async def test_get_current_admin_accepts_admin_token():
-    admin = await get_current_admin(_admin_token("7"))
+    admin = await get_current_admin(_admin_token("7"), x_tenant_code=None, db=None)
     assert isinstance(admin, AdminIdentity)
     assert admin.admin_id == "7"
     assert admin.username == "root"
@@ -46,19 +46,19 @@ async def test_get_current_admin_accepts_admin_token():
 async def test_get_current_admin_rejects_patient_token():
     """患者 token 打管理端接口必须 403，不能只因为"登录了"就放行。"""
     with pytest.raises(BizException) as exc:
-        await get_current_admin(_patient_token())
+        await get_current_admin(_patient_token(), x_tenant_code=None, db=None)
     assert exc.value.status_code == 403
 
 
 async def test_get_current_admin_rejects_unknown_role():
     with pytest.raises(BizException) as exc:
-        await get_current_admin(_admin_token(role="viewer"))
+        await get_current_admin(_admin_token(role="viewer"), x_tenant_code=None, db=None)
     assert exc.value.status_code == 403
 
 
 async def test_get_current_admin_rejects_invalid_token():
     with pytest.raises(BizException) as exc:
-        await get_current_admin("not-a-jwt")
+        await get_current_admin("not-a-jwt", x_tenant_code=None, db=None)
     assert exc.value.status_code == 401
 
 

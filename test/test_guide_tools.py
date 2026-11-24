@@ -6,6 +6,8 @@
 # - 医院信息缺失时如实说明，绝不编造地址电话
 # - 预约/资料整理必须登录，且按 patient_id 隔离
 
+from datetime import datetime, timedelta
+
 from src.modules.medical.model import Appointment, Department, Hospital, Patient
 from src.modules.patient.model import HealthReport, MedicationRecord
 from src.tools import guide_tools
@@ -161,15 +163,19 @@ async def test_manage_appointment_create_validates(fake_db):
     assert "就诊日期" in out
 
 
-async def test_manage_appointment_create_persists(fake_db):
+async def test_manage_appointment_create_generates_pending_request(fake_db):
+    """B2 之后预约走高危动作确认流：create 只生成待确认申请，不直接落库。"""
     db = fake_db()
     out = await coroutine_of(guide_tools.manage_appointment)(
-        "create", FakeRuntime(), department="骨科", appointment_date="2026-11-10", time_slot="上午 09:00-10:00"
+        "create", FakeRuntime(), department="骨科",
+        appointment_date=(datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d"),
+        time_slot="上午 09:00-10:00",
     )
-    assert "已创建预约" in out
+    assert "已生成挂号申请" in out
+    assert "是否确认预约" in out
+    # 待确认动作本身要落库（B2 状态机），但真实 Appointment 尚未创建
     assert db.committed == 1
-    assert db.added[0].department == "骨科"
-    assert db.added[0].status == "confirmed"
+    assert all(not isinstance(obj, Appointment) for obj in db.added)
 
 
 async def test_manage_appointment_cancel_blocks_other_patient(fake_db):

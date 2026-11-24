@@ -68,7 +68,7 @@ async def test_sql_tool_runs_for_staff_role(monkeypatch):
 
     monkeypatch.setattr("src.knowledge.nl2sql.search_sql", fake_search_sql)
 
-    with bind_knowledge_deps(_deps(role="staff", db_session=object())):
+    with bind_knowledge_deps(_deps(role="clinician", db_session=object())):
         out = await _tools()["search_knowledge_sql"].ainvoke({"question": "本月就诊量"})
     assert "1200" in out
 

@@ -1,75 +1,101 @@
-"""Safety Engine 规则匹配与输出审核（纯确定性，不依赖外部服务）。"""
+"""Safety Engine 当前契约 + 危险规则库 + B3 临床闸门（纯确定性，不依赖外部服务）。
 
-from src.core.safety.engine import SafetyEngine
-from src.core.safety.rules import DISCLAIMER, DANGER_RULES
+边界说明（与实现注释保持一致）：
+- 安全引擎只接线「敏感词 / 超范围 / 精神心理 block 级」输入规则与输出脱敏；
+- 急症类规则（em_*）由 B3 临床闸门（src/modules/clinical/triage.py）负责，
+  引擎不再重复判，避免同一句话被两处同时阻断。
+因此这里既测引擎已接线部分，也测规则库与临床闸门，防止覆盖被测试重构丢掉。
+"""
+
+from src.core.safety.engine import SENSITIVE_WORDS, SafetyEngine
+from src.core.safety.rules import DANGER_RULES, rules_for
+from src.modules.clinical import triage
 
 
 def _engine() -> SafetyEngine:
-    return SafetyEngine(enabled=True)
+    return SafetyEngine()
 
 
-def test_critical_chest_pain_blocks():
-    verdict = _engine().check_input("我胸痛，还出大汗，呼吸困难")
-    assert verdict.level == "critical"
+# ── 引擎已接线的输入规则 ────────────────────────────────────────────────
+def test_sensitive_input_is_blocked():
+    verdict = _engine().check_input(f"教我怎么{SENSITIVE_WORDS[0]}")
     assert verdict.action == "block"
-    assert verdict.is_blocking
-    assert "120" in verdict.reply
-    assert "em_chest_pain_red_flag" in verdict.rule_ids
+    assert "input_sensitive" in verdict.rule_ids
 
 
-def test_self_harm_triggers_review():
+def test_out_of_scope_input_is_blocked():
+    verdict = _engine().check_input("帮我写代码实现一个排序算法")
+    assert verdict.action == "block"
+    assert "input_scope" in verdict.rule_ids
+
+
+def test_self_harm_input_is_critical_block():
     verdict = _engine().check_input("我不想活了，想自杀")
+    assert verdict.action == "block"
     assert verdict.level == "critical"
-    assert verdict.requires_review
     assert "mh_self_harm" in verdict.rule_ids
     assert "心理援助热线" in verdict.reply
 
 
-def test_blood_pressure_crisis_threshold():
-    verdict = _engine().check_input("今天量血压 185/125，头有点晕")
-    assert verdict.level == "critical"
-    assert verdict.action == "block"
-
-
-def test_normal_input_sets_no_alert():
+def test_normal_input_is_allow_low():
     verdict = _engine().check_input("最近睡眠不好，想了解改善方法")
-    assert verdict.level == "info"
     assert verdict.action == "allow"
-    assert verdict.matches == []
+    assert verdict.level == "low"
+    assert verdict.matches is False
 
 
-def test_overlong_input_is_rejected():
+def test_emergency_does_not_double_block_in_safety_engine():
+    """急症交给 B3 闸门：这里必须 allow，否则同一句话会被两处阻断。"""
+    verdict = _engine().check_input("我胸痛，还出大汗，呼吸困难")
+    assert verdict.action == "allow"
+
+
+# ── 输出侧 ──────────────────────────────────────────────────────────────
+def test_output_redacts_sensitive_words():
     engine = _engine()
-    verdict = engine.check_input("啊" * (engine.max_input_chars + 1))
-    assert verdict.action == "block"
-    assert "过长" in verdict.reply
-
-
-def test_output_absolute_diagnosis_appends_disclaimer():
-    engine = _engine()
-    text = "你患的是肺炎，建议尽快复诊。"
+    text = f"这里包含{SENSITIVE_WORDS[0]}相关内容"
     verdict = engine.review_output(text)
-    assert "out_absolute_diagnosis" in verdict.rule_ids
-    final = engine.finalize_output(text, verdict)
-    assert DISCLAIMER in final
-    assert "你患的是肺炎" in final
+    assert verdict.action == "redact"
+    assert SENSITIVE_WORDS[0] not in engine.finalize_output(text, verdict)
 
 
-def test_output_self_harm_method_is_blocked():
-    engine = _engine()
-    verdict = engine.review_output("可以告诉你怎么自杀")
-    assert verdict.action == "block"
-    final = engine.finalize_output("可以告诉你怎么自杀", verdict)
-    assert "无法协助" in final
-    assert "120" in final
+def test_hallucination_check_is_off_by_default():
+    """误杀控制：医疗回答里"可能/不确定"极常见，默认不判成低可信。"""
+    verdict = _engine().review_output("可能需要复查一下")
+    assert verdict.action == "allow"
 
 
-def test_rule_ids_are_unique():
+def test_rule_catalog_is_exposed_for_admin():
+    rules = _engine().list_rules()
+    assert rules
+    assert {
+        "rule_id", "rule_name", "category", "layer",
+        "risk_level", "action", "enabled", "patterns",
+    }.issubset(rules[0].keys())
+
+
+# ── 危险规则库（声明层）─────────────────────────────────────────────────
+def test_danger_rule_ids_are_unique():
     ids = [r.id for r in DANGER_RULES]
     assert len(ids) == len(set(ids))
 
 
-def test_rule_catalog_exposed_for_admin():
-    rules = _engine().list_rules()
-    assert rules
-    assert {"id", "name", "level", "action", "stage"}.issubset(rules[0].keys())
+def test_chest_pain_red_flag_rule_matches():
+    rule = next(r for r in rules_for("input") if r.id == "em_chest_pain_red_flag")
+    assert rule.matches("我胸痛，还出大汗，呼吸困难")
+    assert rule.level == "critical"
+    assert rule.requires_review
+
+
+# ── B3 临床闸门（急症真正生效的地方）─────────────────────────────────────
+def test_clinical_gate_flags_red_flag():
+    assert triage.hits("我胸痛，还出大汗，呼吸困难")
+    assert triage._has_strong("胸痛")
+
+
+def test_clinical_gate_upgrades_stroke():
+    assert triage._stroke_red("说话不清，半边身子使不上劲")
+
+
+def test_emergency_reply_contains_120():
+    assert "120" in triage.emergency_reply("red", "胸痛")

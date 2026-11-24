@@ -39,11 +39,18 @@ class _ApptDB:
     async def flush(self) -> None:
         return None
 
+    async def commit(self) -> None:
+        return None
+
     async def execute(self, _stmt):
-        rows = list(self.items.values())
+        # 医生目录查询期望 (profile, name) 二元组；这个 fake 没有医生表，返回空，
+        # resolve_doctor 会按"无候选"走默认分配，不影响预约鉴权断言。
+        rows = [] if "clinician" in str(_stmt).lower() else list(self.items.values())
         return SimpleNamespace(
             scalars=lambda: SimpleNamespace(all=lambda: rows),
             scalar=lambda: len(rows),
+            scalar_one_or_none=lambda: (rows[0] if rows else None),
+            all=lambda: rows,
         )
 
     async def get(self, _model, pk):

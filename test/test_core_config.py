@@ -13,7 +13,7 @@ def _settings(**overrides):
     base = dict(
         DEEPSEEK_API_KEY="", OPENAI_API_KEY="", DASHSCOPE_API_KEY="",
         BASE_URL_CHAT="", CHAT_MODEL="test-model",
-        LLM_TIMEOUT=1.0, LLM_MAX_RETRIES=0,
+        LLM_TIMEOUT=1.0, LLM_MAX_RETRIES=0, LLM_STREAM_USAGE=False,
     )
     base.update(overrides)
     return SimpleNamespace(**base)

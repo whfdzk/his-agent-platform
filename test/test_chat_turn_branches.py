@@ -11,6 +11,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from src.api.routers import chat as chat_router
 from src.api.routers.chat import (
+    ChatIdentity,
     _resolve_identity,
     _run_inquiry_turn_events,
     _stream_supervisor_turn_events,
@@ -19,6 +20,13 @@ from src.api.routers.chat import (
 
 def _request(host: str = "1.2.3.4"):
     return types.SimpleNamespace(client=types.SimpleNamespace(host=host))
+
+
+def _identity(user_id: str, patient_id: int | None = None) -> ChatIdentity:
+    return ChatIdentity(
+        user_id=user_id, authenticated=True, rate_key=f"user:{user_id}",
+        patient_id=patient_id, tenant_id=1,
+    )
 
 
 async def _drain(queue: asyncio.Queue) -> list[dict]:
@@ -31,7 +39,7 @@ async def _drain(queue: asyncio.Queue) -> list[dict]:
 async def test_inquiry_branch_pushes_clarify_then_reply_then_appointment(monkeypatch):
     async def _fake_inquiry_turn(
         message, thread_id, redis, user_id=None, callbacks=None, persist=True,
-        session_id="",
+        session_id="", tenant_id=None,
     ):
         assert message == "我头疼"
         assert session_id == "s"  # 原始会话 ID 要透传，不能把 thread_id 当前缀带下去
@@ -82,13 +90,11 @@ async def test_supervisor_branch_pushes_only_ai_reply_chunks(monkeypatch):
 
     queue: asyncio.Queue = asyncio.Queue()
     await _stream_supervisor_turn_events(
-        "我头疼", "u:s", None, _resolve_identity("1", _request()), "1", "s", queue,
+        "我头疼", "u:s", None, _identity("1"), "1", "s", queue,
     )
 
-    assert await _drain(queue) == [
-        {"type": "token", "content": "您"},
-        {"type": "token", "content": "好"},
-    ]
+    # 相邻 token 会被缓冲合并后再下发，减少 SSE 帧数量
+    assert await _drain(queue) == [{"type": "token", "content": "您好"}]
 
 
 async def test_supervisor_branch_passes_identity_into_context(monkeypatch):
@@ -110,7 +116,7 @@ async def test_supervisor_branch_passes_identity_into_context(monkeypatch):
 
     queue: asyncio.Queue = asyncio.Queue()
     await _stream_supervisor_turn_events(
-        "我头疼", "u:s", None, _resolve_identity("42", _request()), "42", "sess", queue,
+        "我头疼", "u:s", None, _identity("42", patient_id=42), "42", "sess", queue,
     )
     await _drain(queue)
 

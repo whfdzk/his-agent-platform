@@ -133,9 +133,9 @@ async def test_admin_logout_revokes_admin_token(store: _RevocationStore):
     client = TestClient(app)
 
     token = encode_jwt({"sub": "7", "admin_id": 7, "username": "root", "role": "admin"})
-    assert (await get_current_admin(token)).admin_id == "7"
+    assert (await get_current_admin(token, x_tenant_code=None, db=None)).admin_id == "7"
 
     assert client.post("/api/v1/admin/auth/logout", headers=_auth(token)).status_code == 204
     with pytest.raises(BizException) as exc:
-        await get_current_admin(token)
+        await get_current_admin(token, x_tenant_code=None, db=None)
     assert exc.value.status_code == 401

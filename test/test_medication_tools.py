@@ -81,8 +81,8 @@ async def test_query_drug_info_unknown_drug_never_invents(monkeypatch):
 
     monkeypatch.setattr(medication_tools, "_search_instruction_docs", fake_docs)
     out = await coroutine_of(medication_tools.query_drug_info)("不存在的药")
-    assert "暂未收录" in out
-    assert "不要凭记忆编造" in out
+    assert "未收录" in out
+    assert "【未收录】" in out
 
 
 async def test_allergy_risk_requires_login():
