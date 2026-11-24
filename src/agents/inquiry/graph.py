@@ -24,6 +24,7 @@ from src.agents.inquiry.nodes import (
     node_parse_answer,
     node_conclude,
     node_save_record,
+    _wants_direct_answer,
 )
 
 def route_dispatcher(state: InquiryState) -> str:
@@ -46,6 +47,8 @@ def route_after_emergency(state: InquiryState) -> str:
 
 def route_after_extract(state: InquiryState) -> str:
     """症状提取后的路由：有症状查图谱，没症状澄清。"""
+    if _wants_direct_answer(state):
+        return "conclude"
     if state.phase == InquiryPhase.GRAPH_QUERY:
         return "query_neo4j"
     return "clarify"
@@ -53,6 +56,10 @@ def route_after_extract(state: InquiryState) -> str:
 
 def route_after_neo4j(state: InquiryState) -> str:
     """Neo4j 查询后的路由：收敛则结论，否则追问。"""
+    # 用户已经明确说"别问了，直接告诉我挂哪个科"：不再追问/澄清，直接收口。
+    # 图谱没匹配到病也一样要收——无候选时结论节点会给科室建议，比反问体验好得多。
+    if _wants_direct_answer(state):
+        return "conclude"
     if state.phase == InquiryPhase.CONCLUDE:
         return "conclude"
     return "ask_symptoms"
