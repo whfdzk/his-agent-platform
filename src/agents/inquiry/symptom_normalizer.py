@@ -94,7 +94,9 @@ async def match_symptoms_in_neo4j(
     return matched, unmatched
 
 
-SIMILARITY_THRESHOLD = 0.85  # 低于此值视为真正的图谱外症状
+# 低于此值视为真正的图谱外症状。0.85 实测过严：口语"手抖"对图谱"手震颤"是 0.846、
+# "全身乏力"对"乏力"是 0.826，都被卡掉；而不同义词一般落在 0.6 以下，0.78 是安全下限。
+SIMILARITY_THRESHOLD = 0.78
 
 
 async def semantic_match_symptoms(
