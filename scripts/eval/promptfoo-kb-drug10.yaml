@@ -1,0 +1,144 @@
+# 由 scripts/eval/gen_pf_config.py 生成，勿手改
+description: cases_v2 core（10 条）
+prompts:
+  - "{{question}}"
+providers:
+  - id: file://./pf_provider.py
+    label: local-chat
+    config:
+      base_url: "http://127.0.0.1:8000"
+      timeout: 200000
+      timeout_ms: 90
+tests:
+  - description: "kb-01 | kb"
+    metadata:
+      slice: "kb"
+      kind: null
+      source: "core"
+      expect_blocked: false
+    vars:
+      question: "高血压的诊断标准是什么？"
+      session_id: "pf-kb-01"
+      turns_json: "[\"高血压的诊断标准是什么？\"]"
+    assert:
+      - type: icontains-any
+        value: ["140", "90", "非同日"]
+      - type: not-icontains-any
+        value: ["确诊为高血压病"]
+  - description: "kb-02 | kb"
+    metadata:
+      slice: "kb"
+      kind: null
+      source: "core"
+      expect_blocked: false
+    vars:
+      question: "高血压患者每天盐摄入应该控制在多少？"
+      session_id: "pf-kb-02"
+      turns_json: "[\"高血压患者每天盐摄入应该控制在多少？\"]"
+    assert:
+      - type: icontains-any
+        value: ["5克", "5 克", "5g", "五克"]
+  - description: "kb-03 | kb"
+    metadata:
+      slice: "kb"
+      kind: null
+      source: "core"
+      expect_blocked: false
+    vars:
+      question: "妊娠期高血压首选哪些降压药？"
+      session_id: "pf-kb-03"
+      turns_json: "[\"妊娠期高血压首选哪些降压药？\"]"
+    assert:
+      - type: icontains-any
+        value: ["拉贝洛尔", "硝苯地平", "甲基多巴"]
+  - description: "kb-04 | kb"
+    metadata:
+      slice: "kb"
+      kind: null
+      source: "core"
+      expect_blocked: false
+    vars:
+      question: "ACEI 类降压药有哪些禁忌？"
+      session_id: "pf-kb-04"
+      turns_json: "[\"ACEI 类降压药有哪些禁忌？\"]"
+    assert:
+      - type: icontains-any
+        value: ["妊娠", "肾动脉狭窄", "高钾"]
+  - description: "kb-05 | kb"
+    metadata:
+      slice: "kb"
+      kind: null
+      source: "core"
+      expect_blocked: false
+    vars:
+      question: "血压达标以后多久随访一次？"
+      session_id: "pf-kb-05"
+      turns_json: "[\"血压达标以后多久随访一次？\"]"
+    assert:
+      - type: icontains-any
+        value: ["3个月", "3 个月", "三个月", "每3个月"]
+  - description: "kb-06 | kb"
+    metadata:
+      slice: "kb"
+      kind: null
+      source: "core"
+      expect_blocked: false
+    vars:
+      question: "血压到多少需要一开始就联合用药？"
+      session_id: "pf-kb-06"
+      turns_json: "[\"血压到多少需要一开始就联合用药？\"]"
+    assert:
+      - type: icontains-any
+        value: ["160", "100"]
+  - description: "drug-01 | drug"
+    metadata:
+      slice: "drug"
+      kind: null
+      source: "core"
+      expect_blocked: false
+    vars:
+      question: "布洛芬缓释胶囊是做什么用的？"
+      session_id: "pf-drug-01"
+      turns_json: "[\"布洛芬缓释胶囊是做什么用的？\"]"
+    assert:
+      - type: icontains-any
+        value: ["解热镇痛", "退烧", "止痛", "发热", "疼痛"]
+  - description: "drug-02 | drug"
+    metadata:
+      slice: "drug"
+      kind: null
+      source: "core"
+      expect_blocked: false
+    vars:
+      question: "二甲双胍属于哪一类药物？"
+      session_id: "pf-drug-02"
+      turns_json: "[\"二甲双胍属于哪一类药物？\"]"
+    assert:
+      - type: icontains-any
+        value: ["双胍", "降糖", "血糖"]
+  - description: "drug-03 | drug"
+    metadata:
+      slice: "drug"
+      kind: null
+      source: "core"
+      expect_blocked: false
+    vars:
+      question: "阿莫西林是哪一类抗生素？"
+      session_id: "pf-drug-03"
+      turns_json: "[\"阿莫西林是哪一类抗生素？\"]"
+    assert:
+      - type: icontains-any
+        value: ["青霉素"]
+  - description: "drug-04 | drug"
+    metadata:
+      slice: "drug"
+      kind: null
+      source: "core"
+      expect_blocked: false
+    vars:
+      question: "奥美拉唑是怎么起作用的？"
+      session_id: "pf-drug-04"
+      turns_json: "[\"奥美拉唑是怎么起作用的？\"]"
+    assert:
+      - type: icontains-any
+        value: ["质子泵", "胃酸", "抑酸"]

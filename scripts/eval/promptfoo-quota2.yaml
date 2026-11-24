@@ -1,0 +1,40 @@
+# 由 scripts/eval/gen_pf_config.py 生成，勿手改
+description: cases_v2 core（2 条）
+prompts:
+  - "{{question}}"
+providers:
+  - id: file://./pf_provider.py
+    label: local-chat
+    config:
+      base_url: "http://127.0.0.1:8000"
+      timeout: 200000
+      timeout_ms: 90
+tests:
+  - description: "kb-01 | kb"
+    metadata:
+      slice: "kb"
+      kind: null
+      source: "core"
+      expect_blocked: false
+    vars:
+      question: "高血压的诊断标准是什么？"
+      session_id: "pf-kb-01"
+      turns_json: "[\"高血压的诊断标准是什么？\"]"
+    assert:
+      - type: icontains-any
+        value: ["140", "90", "非同日"]
+      - type: not-icontains-any
+        value: ["确诊为高血压病"]
+  - description: "kb-04 | kb"
+    metadata:
+      slice: "kb"
+      kind: null
+      source: "core"
+      expect_blocked: false
+    vars:
+      question: "ACEI 类降压药有哪些禁忌？"
+      session_id: "pf-kb-04"
+      turns_json: "[\"ACEI 类降压药有哪些禁忌？\"]"
+    assert:
+      - type: icontains-any
+        value: ["妊娠", "肾动脉狭窄", "高钾"]
