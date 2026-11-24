@@ -169,6 +169,15 @@ async def lifespan(app: FastAPI):
 
     app.state.embedding_warmup_task = asyncio.create_task(_warmup_embedding())
 
+    # 预热 BM25 关键词索引：8755 个 chunk 建索引约 9 秒，放在第一个知识查询里
+    # 就是实打实的首查延迟。后台建好，请求来的时候直接用。
+    async def _warmup_bm25() -> None:
+        from src.knowledge.bm25_store import warmup as bm25_warmup
+
+        await bm25_warmup()
+
+    app.state.bm25_warmup_task = asyncio.create_task(_warmup_bm25())
+
     # 启动批量持久化队列（消息/token_usage 落库）
     # 落库实现由 modules 层注入：core 只排队攒批，不反向依赖上层
     set_writer(write_batch)

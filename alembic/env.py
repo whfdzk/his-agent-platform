@@ -13,7 +13,7 @@ from src.core.config import get_settings
 
 from src.modules.medical.model import *
 from src.modules.ops.model import *
-from src.modules.ops.trace_model import *
+from src.modules.ops.safety_model import *
 from src.modules.admin.model import *
 from src.modules.patient.model import *
 # 漏导入会让 autogenerate 认为这些表"多余"，尝试 drop_table：

@@ -33,6 +33,17 @@ ROLE_SUPERADMIN = "superadmin"
 # 通配符：持有它表示拥有全部权限（仅 superadmin）
 WILDCARD = "*"
 
+# 院内角色：能查看运营数据（NL2SQL）。患者不在其中。
+# 注意这是"看运营数据"的口径，不等于"能改数据"——写权限另有 scope 控制。
+STAFF_ROLES: frozenset[str] = frozenset({
+    ROLE_CLINICIAN, ROLE_NURSE, ROLE_SERVICE, ROLE_ADMIN, ROLE_SUPERADMIN,
+})
+
+
+def is_staff_role(role: str | None) -> bool:
+    """是否院内角色（可触达运营统计）。未知/空角色一律按患者处理。"""
+    return str(role or "").strip().lower() in STAFF_ROLES
+
 # ---------------- 权限码 ----------------
 # 值是人类可读说明，键是写进 token 的 scope 字符串
 PERMISSION_DEFS: dict[str, str] = {

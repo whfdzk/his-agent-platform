@@ -16,7 +16,8 @@ from src.core.agent_registry import get_active_config
 from src.core.concurrency import guarded
 from src.core.context import UserContext
 from src.core.limits import BudgetExceeded, consume_tool_call
-from src.core.tracing import trace_span
+from src.core.permissions import is_staff_role
+from src.core.langfuse_tracing import trace_span
 from src.agents.inquiry.graph import run_inquiry
 from src.agents.inquiry.deps import build_inquiry_deps
 from src.agents.workers.report_agent import get_report_agent
@@ -257,7 +258,7 @@ async def _run_inquiry(
         # 游客模式 persist=False：不写问诊记录，状态只保留在 Redis（会话级短期记忆）
         deps = await build_inquiry_deps(
             db_session=db, persist=authenticated,
-            tenant_id=int(getattr(ctx, "tenant_id", 1) or 1),
+            tenant_id=tenant_id,
         )
         reply, new_state = await guarded(
             run_inquiry(
@@ -286,7 +287,7 @@ async def _run_inquiry(
             # Redis 里只保留指针，供 chat 层收尾时下发确认卡片
             action_id = await _create_handoff_action(
                 new_state.handoff_payload, user_id, session_id, authenticated,
-                tenant_id=int(getattr(ctx, "tenant_id", 1) or 1),
+                tenant_id=tenant_id,
             )
             logger.info(f"问诊出结论，待患者确认 action_id={action_id} user={user_id}")
             ask = "请问是否现在帮您预约挂号？回复「需要」即可预约，回复「不用」就不预约。"
@@ -386,6 +387,7 @@ async def _invoke_patient_worker(
                     config={"configurable": {"thread_id": f"{user_id}:{session_id}"}},
                     context=UserContext(
                         user_id=user_id, session_id=session_id, tenant_id=tenant_id,
+                        role=_role,
                     ),
                 ),
                 timeout=settings.WORKER_TIMEOUT,
@@ -464,6 +466,13 @@ async def call_operation_agent(message: str, runtime: ToolRuntime[UserContext]) 
     blocked = _guard_budget("call_operation_agent")
     if blocked:
         return blocked
+    # 工具面按角色收敛：患者拿到的是一句拒绝，不进运营 Agent、不起 DB 会话。
+    # 工具内部的 is_staff 守卫（knowledge/tools.py: search_knowledge_sql）仍然保留 ——
+    # 两道是互补的：这里挡"根本不进链"，那里挡"配置漂移把工具挂错人"。
+    _uid, _sid, role = _ctx_of(runtime)
+    if not is_staff_role(role):
+        logger.info(f"call_operation_agent 被角色拦截：role={role} user={_uid}")
+        return "运营数据查询仅对内部运营人员开放，当前账号无权访问。"
     return await _invoke_knowledge_worker(
         tool_name="call_operation_agent",
         message=message,

@@ -9,10 +9,10 @@ from src.core.config import get_settings, Settings
 def _inject_context(record) -> None:
     """把 request_id / trace_id 注入每条日志，便于按链路检索。
 
-    延迟 import 以避免 core.logger ←→ core.tracing 的导入环。
+    延迟 import 以避免 core.logger ←→ core.langfuse_tracing 的导入环。
     """
     try:
-        from src.core.tracing import log_context
+        from src.core.langfuse_tracing import log_context
         # 1. 从 tracing 模块拿到当前请求上下文（request_id、trace_id 等）
         for key, value in log_context().items():
             record["extra"].setdefault(key, value)

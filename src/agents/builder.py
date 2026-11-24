@@ -19,6 +19,8 @@ from loguru import logger
 from src.core.agent_registry import AgentRuntimeConfig
 from src.core.config import build_llm
 from src.agents.tool_registry import resolve_tools
+from src.agents.repeat_middleware import RepeatGuardMiddleware
+from src.agents.search_budget_middleware import SearchBudgetMiddleware
 
 DEFAULT_TEMPERATURE = 0.7
 # 未显式配置 max_turns 时的轮次上限：单次问诊 8 轮模型↔工具往返已足够，
@@ -116,11 +118,15 @@ def build_worker_agent(
     system_prompt = cfg.system_prompt or default_prompt
     if prompt_suffix:
         system_prompt = f"{system_prompt}\n\n{prompt_suffix}"
+    # 打转拦截对 worker 同样必要：容器里没有 supervisor，模型自己就会"换个措辞再查一次"
+    # （实测药品 agent 连调 3 次 query_drug_info，每次 15s）。命中同工具同参数时
+    # 直接把上次的结论当工具结果回给模型，逼它收敛到作答。
     agent = create_agent(
         model=llm_for(cfg, default_temperature=default_temperature, default_model=default_model),
         tools=tools,
         system_prompt=system_prompt,
         name=cfg.agent_name,
+        middleware=[RepeatGuardMiddleware(), SearchBudgetMiddleware()],
     )
     logger.info(
         f"{cfg.code} agent 已装配：工具 {len(tools)} 个，提示词来源 "

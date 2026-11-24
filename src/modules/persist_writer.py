@@ -22,7 +22,7 @@ from src.knowledge.model import Citation
 from src.modules.chat.model import ChatMessage, Conversation
 from src.modules.ops.audit_model import KnowledgeAuditLog
 from src.modules.ops.model import TokenUsage
-from src.modules.ops.trace_model import AgentSpan, AgentTrace, SafetyEvent
+from src.modules.ops.safety_model import SafetyEvent
 
 
 def _conversation_rollup(messages: list[dict]) -> dict[int, dict]:
@@ -101,48 +101,6 @@ async def _insert_usages(usages: list[dict]) -> None:
             await asyncio.sleep(0.2 * (attempt + 1))
 
 
-async def _insert_traces(traces: list[dict]) -> None:
-    """agent_traces：按 trace_id 幂等 upsert（同轮重复 finish 只更新聚合字段）。"""
-    for attempt in range(MAX_RETRIES):
-        try:
-            async with AsyncSessionLocal() as session:
-                stmt = pg_insert(AgentTrace).values(traces)
-                update_cols = {
-                    c: getattr(stmt.excluded, c)
-                    for c in (
-                        "status", "error_type", "latency_ms", "prompt_tokens",
-                        "completion_tokens", "total_tokens", "tool_calls", "tool_names",
-                        "agent_calls", "retrieval_count", "retrieval_sources",
-                        "safety_level", "safety_result", "safety_rules",
-                        "input_chars", "output_chars", "model_name", "model_version",
-                    )
-                }
-                await session.execute(
-                    stmt.on_conflict_do_update(index_elements=["trace_id"], set_=update_cols)
-                )
-                await session.commit()
-            return
-        except Exception as e:
-            if attempt == MAX_RETRIES - 1:
-                logger.warning(f"agent_traces 落库失败（丢弃 {len(traces)} 条）: {e}")
-                return
-            await asyncio.sleep(0.2 * (attempt + 1))
-
-
-async def _insert_spans(spans: list[dict]) -> None:
-    for attempt in range(MAX_RETRIES):
-        try:
-            async with AsyncSessionLocal() as session:
-                session.add_all([AgentSpan(**s) for s in spans])
-                await session.commit()
-            return
-        except Exception as e:
-            if attempt == MAX_RETRIES - 1:
-                logger.warning(f"agent_spans 落库失败（丢弃 {len(spans)} 条）: {e}")
-                return
-            await asyncio.sleep(0.2 * (attempt + 1))
-
-
 async def _insert_safety_events(events: list[dict]) -> None:
     for attempt in range(MAX_RETRIES):
         try:
@@ -190,8 +148,6 @@ async def write_batch(batch: list[PersistItem]) -> None:
     """消费一个批次：按类型分组后各自批量写入。"""
     messages = [i.payload for i in batch if i.kind == "chat_message"]
     usages = [i.payload for i in batch if i.kind == "token_usage"]
-    traces = [i.payload for i in batch if i.kind == "agent_trace"]
-    spans = [i.payload for i in batch if i.kind == "agent_span"]
     safety_events = [i.payload for i in batch if i.kind == "safety_event"]
     audits = [i.payload for i in batch if i.kind == "knowledge_audit"]
     citations = [i.payload for i in batch if i.kind == "citation"]
@@ -199,10 +155,6 @@ async def write_batch(batch: list[PersistItem]) -> None:
         await _insert_messages(messages)
     if usages:
         await _insert_usages(usages)
-    if traces:
-        await _insert_traces(traces)
-    if spans:
-        await _insert_spans(spans)
     if safety_events:
         await _insert_safety_events(safety_events)
     if audits:

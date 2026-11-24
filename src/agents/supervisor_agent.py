@@ -19,6 +19,7 @@ from src.agents.builder import apply_max_turns, llm_for, summarization_middlewar
 from src.agents.tool_registry import resolve_tools, resolve_worker_tools
 from src.agents.worker_tools import WORKER_TOOLS
 from src.modules.handoff.middleware import HandoffInterruptMiddleware
+from src.agents.repeat_middleware import RepeatGuardMiddleware
 from src.tools.handoff_tools import HANDOFF_TOOL_NAME, request_human_handoff
 from src.core.agent_registry import AgentRuntimeConfig, get_active_config
 from src.core.context import UserContext
@@ -216,6 +217,10 @@ async def _build_supervisor(cfg: AgentRuntimeConfig):
     # 转人工挂起：模型调用 request_human_handoff 时建单并 interrupt()，
     # 坐席处理完由 Command(resume=...) 续跑（见 modules/handoff/middleware.py）
     middleware.append(HandoffInterruptMiddleware())
+    # 打转拦截：同一「工具+参数」在窗口内重复提交时，不再执行工具、直接回提示。
+    # 放在 handoff 之后：转人工调用本身也可能重复，但那条路径由 handoff 处理更合适
+    # （它需要建单/挂起，不能被就地拦成一条文本）。
+    middleware.append(RepeatGuardMiddleware())
     summarization = summarization_middleware(cfg, default_model=settings.CHAT_MODEL)
     if summarization is not None:  # 会话总结压缩
         middleware.append(summarization)

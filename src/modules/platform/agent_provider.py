@@ -159,6 +159,16 @@ async def load_agent_configs() -> AgentLoadResult:
                 status=agent.status or "draft",
                 description=agent.description or "",
                 prompt_content=prompt_contents.get(prompt_id, "") if isinstance(prompt_id, int) else "",
+                # 只有真正取到激活版本正文时才算"有版本"：prompts 表为空（当前全是内联
+                # system_prompt）时留空，不编一个假版本号进 trace。
+                prompt_version=(
+                    f"v{prompt_rows[prompt_id].active_version}"
+                    if isinstance(prompt_id, int)
+                    and prompt_id in prompt_rows
+                    and prompt_contents.get(prompt_id)
+                    and prompt_rows[prompt_id].active_version is not None
+                    else ""
+                ),
                 model_name=(model_row.model_name if model_row else ""),
                 model_base_url=(model_row.base_url if model_row else ""),
                 model_api_key=(model_row.api_key if model_row else ""),

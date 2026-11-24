@@ -25,7 +25,7 @@ from loguru import logger
 
 from src.core.limits import note_tokens
 from src.core.persist_queue import PersistItem, enqueue
-from src.core.tracing import current_trace
+from src.core.langfuse_tracing import current_trace
 
 # 已告警过「usage 为空」的模型，避免每条调用刷日志
 _ZERO_USAGE_WARNED: set[str] = set()

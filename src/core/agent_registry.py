@@ -91,6 +91,8 @@ class AgentRuntimeConfig:
     # 提示词
     system_prompt: str = ""
     prompt_id: int | None = None
+    # 激活版本号（prompt_versions.version，形如 "v3"）；内联提示词或回退内置时为 ""
+    prompt_version: str = ""
 
     # 模型
     model_config_id: int | None = None
@@ -230,6 +232,7 @@ def parse_agent_config(
     status: str = "draft",
     description: str = "",
     prompt_content: str = "",
+    prompt_version: str = "",
     model_name: str = "",
     model_base_url: str = "",
     model_api_key: str = "",
@@ -257,6 +260,7 @@ def parse_agent_config(
         description=description,
         system_prompt=system_prompt,
         prompt_id=prompt_id if isinstance(prompt_id, int) else None,
+        prompt_version=(prompt_version or "").strip(),
         model_config_id=model_config_id if isinstance(model_config_id, int) else None,
         model=model,
         base_url=(model_base_url or "").strip(),
