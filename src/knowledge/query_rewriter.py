@@ -6,6 +6,7 @@ from loguru import logger
 from langchain_core.messages import SystemMessage
 from langchain_core.language_models import BaseChatModel
 
+from src.knowledge.llm_call import UTIL_TIMEOUT, call_llm
 from src.knowledge.prompts import QUERY_REWRITE_PROMPT
 
 
@@ -20,9 +21,15 @@ async def rewrite_query(
 
     """
     prompt = QUERY_REWRITE_PROMPT.format(question=question, role=role)
-    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    response = await call_llm(
+        llm, [SystemMessage(content=prompt)],
+        timeout=UTIL_TIMEOUT, label="查询改写",
+    )
+    if response is None:
+        # 超时即退回原问题：多一次改写的收益不值得让用户等
+        return {"queries": [question], "intent": "knowledge_qa"}
     try:
-        content = response.content.strip()
+        content = (response.content or "").strip()
         if "```" in content:
             content = content.split("```")[1].lstrip("json").strip()
         result = json.loads(content)

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from langchain_core.tools import tool
 from loguru import logger
@@ -21,6 +22,8 @@ __all__ = ["KnowledgeDeps", "build_knowledge_tools"]
 
 # Query 改写的预算：这一步只是"锦上添花"，模型慢的时候不能拖住整轮问答
 REWRITE_TIMEOUT = 10.0
+# 工具回给模型的最大原文片段长度：够写出有依据的答案，又不至于把上下文顶爆
+DOC_CONTEXT_MAX_CHARS = 3000
 
 settings = get_settings()
 
@@ -54,7 +57,7 @@ async def _rewrite(question: str, deps: KnowledgeDeps) -> str:
 
     try:
         result = await asyncio.wait_for(
-            rewrite_query(question, deps.llm, deps.role), timeout=REWRITE_TIMEOUT
+            rewrite_query(question, deps.util_llm, deps.role), timeout=REWRITE_TIMEOUT
         )
         return result["queries"][0] if result.get("queries") else question
     except Exception as e:
@@ -74,34 +77,48 @@ def build_knowledge_tools(deps: KnowledgeDeps | None = None) -> list:
 
     @tool
     async def search_knowledge_docs(question: str, doc_type: str = "") -> str:
-        """从知识文档库中检索信息并生成回答。
+        """从知识文档库中检索原文片段（指南/说明书/SOP/文献），由你据片段作答。
         适用：查询临床指南、药品说明书、医院制度SOP、医学文献等文档内容。
         question: 用户的问题
         doc_type: 可选，文档类型过滤（guideline/drug_instruction/sop/literature）。
             谨慎使用：只有确定答案一定在该类文档里时才传，否则留空查全库。
             问"某类药的禁忌/不良反应/能不能用"时通常不要过滤——
             禁忌和适应证多写在指南里，只查说明书会漏掉关键条款。"""
-        from src.knowledge.doc_rag import search_docs
+        from src.knowledge.cache import cached, make_key
+        from src.knowledge.doc_rag import format_doc_context, search_docs_raw
 
         try:
             d = _deps()
             if d.milvus_client is None or d.embedding_model is None:
                 return "知识文档库暂时不可用（向量库未就绪），请基于通用医学常识回答，并说明资料暂缺。"
-            rewritten = await _rewrite(question, d)
-            with Timer() as t:
-                result = await search_docs(
-                    question=rewritten, embedding_model=d.embedding_model,
-                    milvus_client=d.milvus_client, llm=d.llm,
-                    doc_type=doc_type or None, role=d.role,
+
+            async def _compute() -> str:
+                # 只回检索到的原文片段，不在工具里再"生成一篇回答"。
+                # 实测：工具侧生成 2857 token 用了 35s，agent 拿到后再压缩成自己的回答
+                # 又是 20s，同一份内容写两遍占了整轮 70s 的大头。
+                # 改写（_rewrite）也一并去掉：检索片段够用时它只是多一次模型调用。
+                hits = await search_docs_raw(
+                    question=question, embedding_model=d.embedding_model,
+                    milvus_client=d.milvus_client,
+                    doc_type=doc_type or None,
                     # HyDE 会多一次 LLM 调用，患者问答场景性价比不高，默认不用
                     use_hyde=False,
-                    with_grounding=True,
+                    # 缓存键用工具入参的原始问题：改写措辞每次都不一样，用改写结果做键命中不了
+                    cache_question=question,
+                )
+                return format_doc_context(hits)[:DOC_CONTEXT_MAX_CHARS]
+
+            with Timer() as t:
+                result = await cached(
+                    make_key("tool_docs", question.strip(), doc_type or "", d.role),
+                    _compute,
+                    label=f"tool_docs:{question[:12]}",
                 )
             QueryAuditLog.log(
                 d.user_id, d.role, question, "doc_rag",
                 ["doc_rag"], result[:80], t.elapsed_ms,
             )
-            return result
+            return result or "知识文档库中未检索到与该问题相关的片段。"
         except _DepsUnavailable:
             return "知识检索依赖未初始化，请基于通用医学常识回答，并说明资料暂缺。"
         except Exception as e:
@@ -113,17 +130,30 @@ def build_knowledge_tools(deps: KnowledgeDeps | None = None) -> list:
         """从医学知识图谱中检索实体关系并生成回答。
         适用：查询疾病与症状/药物/科室/检查/食物之间的关系，多跳推理。
         question: 用户的问题"""
-        from src.knowledge.graph_rag import search_graph
+        from src.knowledge.cache import cached, make_key
+        from src.knowledge.graph_rag import search_graph_raw
 
         try:
             d = _deps()
             if d.neo4j_driver is None:
                 return "知识图谱暂时不可用，请基于通用医学常识回答，并说明资料暂缺。"
-            rewritten = await _rewrite(question, d)
+
+            async def _compute() -> str:
+                # 只回原始关系记录，不再在工具里"整合成一篇回答"：调用方 agent 自己就会写，
+                # 工具侧再写一遍会多一次 600 token / 9s 的生成，且两段结论口径容易打架。
+                records = await search_graph_raw(
+                    question=question, neo4j_driver=d.neo4j_driver, llm=d.util_llm or d.llm,
+                    cache_question=question,
+                )
+                if not records:
+                    return ""
+                return json.dumps(records, ensure_ascii=False)[:1800]
+
             with Timer() as t:
-                result = await search_graph(
-                    question=rewritten, neo4j_driver=d.neo4j_driver,
-                    llm=d.llm, role=d.role,
+                result = await cached(
+                    make_key("tool_graph", question.strip(), d.role),
+                    _compute,
+                    label=f"tool_graph:{question[:12]}",
                 )
             QueryAuditLog.log(
                 d.user_id, d.role, question, "graph_rag",
@@ -155,7 +185,7 @@ def build_knowledge_tools(deps: KnowledgeDeps | None = None) -> list:
 
         try:
             with Timer() as t:
-                result = await search_sql(question=question, llm=d.llm, db=d.db_session)
+                result = await search_sql(question=question, llm=d.util_llm, db=d.db_session)
             QueryAuditLog.log(
                 d.user_id, d.role, question, "nl2sql",
                 ["nl2sql"], result[:80], t.elapsed_ms,
@@ -167,25 +197,35 @@ def build_knowledge_tools(deps: KnowledgeDeps | None = None) -> list:
 
     @tool
     async def search_knowledge_multi(question: str) -> str:
-        """多通道融合检索：同时查文档库和知识图谱，综合多个来源生成回答。
+        """多通道检索：一次并行查文档库和知识图谱，返回两路证据原文，由你据证据作答。
         适用：复杂问题，需要同时参考指南文档和实体关系才能回答。
         例如："糖尿病合并肾功能不全的降糖方案"需要同时查指南和药物禁忌。
         question: 用户的问题"""
+        from src.knowledge.cache import cached, make_key
         from src.knowledge.fusion import multi_channel_search
 
         try:
             d = _deps()
             if (d.milvus_client is None or d.embedding_model is None) and d.neo4j_driver is None:
                 return "知识库暂时不可用，请基于通用医学常识回答，并说明资料暂缺。"
-            rewritten = await _rewrite(question, d)
-            with Timer() as t:
-                result = await multi_channel_search(
-                    question=rewritten, llm=d.llm,
+
+            async def _compute() -> str:
+                return await multi_channel_search(
+                    question=question, llm=d.llm,
                     embedding_model=d.embedding_model,
                     milvus_client=d.milvus_client,
                     neo4j_driver=d.neo4j_driver,
                     db_session=d.db_session,
                     role=d.role,
+                    util_llm=d.util_llm,
+                    cache_question=question,
+                )
+
+            with Timer() as t:
+                result = await cached(
+                    make_key("tool_multi", question.strip(), d.role),
+                    _compute,
+                    label=f"tool_multi:{question[:12]}",
                 )
             QueryAuditLog.log(
                 d.user_id, d.role, question, "multi",

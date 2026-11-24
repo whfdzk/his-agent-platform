@@ -48,7 +48,6 @@ _DEFAULT_TOOL_IDS = (
     "search_knowledge_graph",
     "search_knowledge_sql",
     "search_knowledge_multi",
-    "search_knowledge_agentic",
     "review_prescription_tool",
     "list_knowledge_sources",
 )

@@ -10,6 +10,7 @@ from langchain_core.embeddings import Embeddings
 from neo4j import AsyncDriver
 from pymilvus import MilvusClient
 
+from src.knowledge.llm_call import ANSWER_TIMEOUT, UTIL_TIMEOUT, call_llm, call_llm_text
 from src.knowledge.prompts import (
     PRESCRIPTION_PARSE_PROMPT, PRESCRIPTION_REPORT_PROMPT,
 )
@@ -20,9 +21,14 @@ from src.knowledge.graph_rag import search_graph_raw
 async def _parse_prescription(question: str, llm: BaseChatModel) -> dict:
     """从自然语言中提取处方结构化信息。"""
     prompt = PRESCRIPTION_PARSE_PROMPT.format(question=question)
-    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    response = await call_llm(
+        llm, [SystemMessage(content=prompt)],
+        timeout=UTIL_TIMEOUT, label="处方解析",
+    )
+    if response is None:
+        return {"drugs": [], "patient_info": {"allergies": [], "diseases": []}}
     try:
-        content = response.content.strip()
+        content = (response.content or "").strip()
         if "```" in content:
             content = content.split("```")[1].lstrip("json").strip()
         return json.loads(content)
@@ -196,5 +202,8 @@ async def review_prescription(
     prompt = PRESCRIPTION_REPORT_PROMPT.format(
         prescription=prescription_str, check_results=results_str,
     )
-    response = await llm.ainvoke([SystemMessage(content=prompt)])
-    return response.content
+    return await call_llm_text(
+        llm, [SystemMessage(content=prompt)],
+        timeout=ANSWER_TIMEOUT, label="处方审核报告生成",
+        default="处方审核已完成，但报告生成超时，请稍后再试或咨询药师。",
+    )

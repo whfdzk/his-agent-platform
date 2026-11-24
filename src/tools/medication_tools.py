@@ -38,6 +38,9 @@ SECTION_FIELDS: dict[str, tuple[str, str]] = {
 _INGREDIENT_RE = re.compile(r"(?:【)?(?:主要)?成分(?:】)?[:：]\s*([^\n。；]{2,200})")
 _MAX_TEXT = 600
 
+# 指南兜底的分数下限：低于它的片段基本是"字面撞上禁忌两个字"，引用会误导
+GUIDELINE_FALLBACK_MIN_SCORE = 0.45
+
 
 async def _load_drug(drug_name: str) -> dict | None:
     """按药品名/别名查结构化说明书；返回 None 表示库里没有。"""
@@ -85,24 +88,54 @@ def _clip(text: str | None) -> str:
 
 async def _search_instruction_docs(drug_name: str, section: str) -> str:
     """结构化说明书缺失时，从知识库（Milvus 药品说明书）兜底检索。"""
-    from src.core.config import get_llm
     from src.infra.embedding import get_embeddings
     from src.infra.milvus_client import get_milvus_client
-    from src.knowledge.doc_rag import search_docs
+    from src.knowledge.doc_rag import format_doc_context, search_docs_raw
 
     question = f"{drug_name}的{SECTION_FIELDS.get(section, ('说明书', ''))[0]}"
     try:
         # 同步建连放进线程池，避免阻塞事件循环
         milvus_client = await to_thread(get_milvus_client)
-        return await search_docs(
+        # 只取原文片段，不在这里生成答案：调用方本来就是会写答案的 agent，
+        # 在工具里再生成一遍既多一次 6~8s 的模型调用，也会出现"工具答案 + 最终答案"
+        # 两套口径（实测 3 次调用里 2 次是重复生成）。HyDE 也关掉，省一次模型调用。
+        hits = await search_docs_raw(
             question=question,
             embedding_model=get_embeddings(),
             milvus_client=milvus_client,
-            llm=get_llm(temperature=0.1),
             doc_type="drug_instruction",
-            role="patient",
-            with_grounding=True,
+            use_hyde=False,
+            cache_question=question,
         )
+        # 只认"确实是这个药"的说明书。ACEI 这类查询常常命中别的药（库里有布洛芬、
+        # 奥美拉唑的说明书，都写着"禁忌"两个字，精排分照样过阈值），直接拼进上下文
+        # 会让 agent 判成"全部无关 → 未收录"，而真正的类级禁忌其实写在指南里
+        # （实测指南 chunk 明确写"妊娠、双侧双肾动脉狭窄、高钾血症禁用"）。
+        matched = [h for h in hits if drug_name in (h.get("doc_name") or "")]
+        label = ""
+        if not matched:
+            # 退到指南：类级禁忌/注意事项写在指南里（如 ACEI 段的"妊娠、双侧肾动脉狭窄、
+            # 高钾血症禁用"），而不是个别说明书。不回退全库——全库会被疾病百科占满
+            # （实测"卡托普利的禁忌"全库 top1 是"急性左侧心力衰竭"百科，0.41），
+            # 拼进上下文只会诱导模型引用无关疾病。
+            hits = await search_docs_raw(
+                question=question,
+                embedding_model=get_embeddings(),
+                milvus_client=milvus_client,
+                doc_type="guideline",
+                use_hyde=False,
+                cache_question=f"{question}#guideline",
+            )
+            matched = [
+                h for h in hits
+                if (h.get("rerank_score") or 0.0) >= GUIDELINE_FALLBACK_MIN_SCORE
+            ][:3]
+            label = "【指南检索（未找到该药单独说明书，以下为指南中的类级条目）】\n" if matched else ""
+        context = format_doc_context(matched)
+        if not context:
+            return ""
+        # 片段可能很长，按检索预算截断，避免把上下文顶爆
+        return label + context[:_MAX_TEXT]
     except Exception as e:
         logger.warning(f"药品说明书向量检索失败: {type(e).__name__}: {e}")
         return ""
@@ -136,10 +169,10 @@ async def query_drug_info(drug_name: str, section: str = "") -> str:
         fallback = await _search_instruction_docs(name, section)
         if fallback:
             return f"【知识库检索结果】\n{fallback}"
-        return (
-            f"药品库与知识库中暂未收录「{name}」的说明书，无法确认其成分/禁忌/不良反应。"
-            "请提示用户以药品包装说明书为准，或咨询药师；不要凭记忆编造。"
-        )
+        # 只陈述事实，不在这里写"不要再查"这类指令：工具结果里的祈使句会被模型
+        # 当成用户诉求的一部分（实测它回了一句"你的问题里似乎混入了系统说明"）。
+        # 收敛交给 SearchBudgetMiddleware。
+        return f"【未收录】药品库与知识库中都没有「{name}」的说明书条目。"
 
     sections = [section] if section in SECTION_FIELDS else list(SECTION_FIELDS)
     parts = [f"【{drug['name']} 说明书（结构化数据）】"]

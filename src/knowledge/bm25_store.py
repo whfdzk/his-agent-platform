@@ -89,6 +89,27 @@ def invalidate() -> None:
     """知识库有增删时调用，下次检索强制重建索引。"""
     global _index
     _index = None
+    try:
+        # 检索结果缓存也一起清：否则新旧 chunk 混着用，命中缓存时看不到新导入的内容
+        from src.knowledge.cache import clear as clear_query_cache
+
+        clear_query_cache()
+    except Exception:
+        pass
+
+
+async def warmup() -> None:
+    """启动时后台建一次索引。8755 个 chunk 约 9 秒，
+    否则进程重启 / TTL 到期后的第一个知识查询要白等这 9 秒。"""
+    try:
+        from src.infra.milvus_client import get_milvus_client
+
+        client = await to_thread(get_milvus_client)
+        index = await _get_index(client)
+        if index is not None:
+            logger.info(f"BM25 索引预热完成: {len(index['docs'])} 个 chunk")
+    except Exception as e:
+        logger.warning(f"BM25 索引预热失败（首次查询将较慢）: {type(e).__name__}: {e}")
 
 
 def _score_and_pick(index: dict, query: str, top_k: int, doc_type: str | None) -> list[dict]:

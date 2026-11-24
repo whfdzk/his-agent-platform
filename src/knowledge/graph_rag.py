@@ -9,20 +9,30 @@ from neo4j import AsyncDriver
 
 from src.core.config import get_settings
 from src.core.limits import clamp_retrieval
-from src.core.tracing import current_trace
+from src.core.langfuse_tracing import current_trace
+from src.knowledge.cache import cached, make_key
+from src.knowledge.llm_call import UTIL_TIMEOUT, call_llm, call_llm_text
 from src.knowledge.prompts import (
-    ENTITY_EXTRACT_PROMPT, NL2CYPHER_PROMPT, GRAPH_QA_PROMPT,
+    ENTITY_EXTRACT_PROMPT, NL2CYPHER_PROMPT,
 )
 
 settings = get_settings()
 MAX_CYPHER_RETRIES = 2
 
+# 实体抽取 / NL2Cypher 是工具内小调用，8s 足够；图查询本身另有 Neo4j 侧超时
+GRAPH_UTIL_TIMEOUT = 8.0
+
 
 async def _extract_entities(question: str, llm: BaseChatModel) -> dict:
     prompt = ENTITY_EXTRACT_PROMPT.format(question=question)
-    response = await llm.ainvoke([SystemMessage(content=prompt)])
+    response = await call_llm(
+        llm, [SystemMessage(content=prompt)],
+        timeout=GRAPH_UTIL_TIMEOUT, label="图谱实体抽取",
+    )
+    if response is None:
+        return {"diseases": [], "symptoms": [], "drugs": [], "departments": [], "checks": []}
     try:
-        content = response.content.strip()
+        content = (response.content or "").strip()
         if "```" in content:
             content = content.split("```")[1].lstrip("json").strip()
         return json.loads(content)
@@ -41,8 +51,10 @@ async def _generate_cypher(
         question=question,
         entities=json.dumps(entities, ensure_ascii=False),
     ) + extra
-    response = await llm.ainvoke([SystemMessage(content=prompt)])
-    cypher = response.content.strip()
+    cypher = await call_llm_text(
+        llm, [SystemMessage(content=prompt)],
+        timeout=GRAPH_UTIL_TIMEOUT, label="图谱 NTLCypher 生成",
+    )
     if "```" in cypher:
         cypher = cypher.split("```")[1].lstrip("cypher").strip()
     return cypher
@@ -61,8 +73,26 @@ async def search_graph_raw(
     question: str,
     neo4j_driver: AsyncDriver,
     llm: BaseChatModel,
+    util_llm: BaseChatModel | None = None,
+    cache_question: str | None = None,
 ) -> list[dict]:
-    """GraphRAG 检索，返回原始图谱查询结果（不经过 LLM 生成）。"""
+    """GraphRAG 检索，返回原始图谱查询结果（不经过 LLM 生成）。
+
+    实体提取与 Cypher 生成都走 util_llm（关思考、限输出），只有最终整合用 llm。
+    结果按问题缓存：同一轮里 drug_agent 与 knowledge_agent 会重复查同一条图谱。
+    """
+    u = util_llm or llm
+
+    async def _compute() -> list[dict]:
+        return await _graph_raw(question, neo4j_driver, u)
+
+    # 同 doc_rag：键用原始问题，改写变了也能命中
+    key_question = cache_question or question
+    key = make_key("graph", key_question)
+    return await cached(key, _compute, label=f"graph:{key_question[:14]}")
+
+
+async def _graph_raw(question: str, neo4j_driver: AsyncDriver, llm: BaseChatModel) -> list[dict]:
     entities = await _extract_entities(question, llm)
     # 补一层"类别词/口语症状 → 图谱实际存法"的映射，否则 ACEI、干咳这类词
     # 去 MATCH 节点名恒为 0（图谱存的是"缬沙坦胶囊""咳嗽"）
@@ -101,23 +131,3 @@ async def search_graph_raw(
                 return []
     return []
 
-
-# 增强生成回答
-async def search_graph(
-    question: str,
-    neo4j_driver: AsyncDriver,
-    llm: BaseChatModel,
-    role: str = "patient",
-) -> str:
-    """GraphRAG 完整流程：实体提取 → NL2Cypher（带重试）→ LLM 整合。"""
-    records = await search_graph_raw(question, neo4j_driver, llm)
-
-    if not records:
-        return "知识图谱中未找到与您问题相关的信息。"
-
-    graph_result = json.dumps(records, ensure_ascii=False, indent=2)
-    prompt = GRAPH_QA_PROMPT.format(
-        question=question, graph_result=graph_result, role=role,
-    )
-    response = await llm.ainvoke([SystemMessage(content=prompt)])
-    return response.content

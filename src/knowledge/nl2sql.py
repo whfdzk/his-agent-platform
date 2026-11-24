@@ -12,6 +12,7 @@ from sqlalchemy import text
 
 from src.core.config import get_settings
 from src.core.redaction import redact_text
+from src.knowledge.llm_call import ANSWER_TIMEOUT, UTIL_TIMEOUT, call_llm_text
 from src.knowledge.prompts import NL2SQL_PROMPT, SQL_QA_PROMPT
 
 settings = get_settings()
@@ -93,8 +94,11 @@ async def _generate_sql(
     if error_hint:
         extra = f"\n\n上一次生成的 SQL 执行报错：{error_hint}\n请修正后重新生成。"
     prompt = NL2SQL_PROMPT.format(question=question) + extra
-    response = await llm.ainvoke([SystemMessage(content=prompt)])
-    sql = response.content.strip()
+    # 超时返回空串：下游 _validate_sql 会判为非法并直接终止，不会拿半截 SQL 去执行
+    sql = await call_llm_text(
+        llm, [SystemMessage(content=prompt)],
+        timeout=UTIL_TIMEOUT, label="NL2SQL 生成 SQL",
+    )
     if "```" in sql:
         sql = sql.split("```")[1].lstrip("sql").strip()
     return sql
@@ -156,5 +160,8 @@ async def search_sql(
     result_str = json.dumps(data, ensure_ascii=False, indent=2, default=str)
     # 增强生成回答
     prompt = SQL_QA_PROMPT.format(question=question, sql=executed_sql, result=result_str)
-    response = await llm.ainvoke([SystemMessage(content=prompt)])
-    return response.content
+    answer = await call_llm_text(
+        llm, [SystemMessage(content=prompt)],
+        timeout=ANSWER_TIMEOUT, label="NL2SQL 结果解读",
+    )
+    return answer or "运营数据查询有结果，但解读生成超时，请稍后再问一次。"

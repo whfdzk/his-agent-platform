@@ -6,6 +6,7 @@ from langchain_core.messages import SystemMessage
 from langchain_core.language_models import BaseChatModel
 from langchain_core.embeddings import Embeddings
 
+from src.knowledge.llm_call import UTIL_TIMEOUT, call_llm
 from src.knowledge.prompts import HYDE_PROMPT
 
 
@@ -22,8 +23,13 @@ async def generate_hyde_embedding(
     """
     prompt = HYDE_PROMPT.format(question=question)
     try:
-        response = await llm.ainvoke([SystemMessage(content=prompt)])
-        hypothetical_doc = response.content.strip()
+        response = await call_llm(
+            llm, [SystemMessage(content=prompt)],
+            timeout=UTIL_TIMEOUT, label="HyDE 假设文档生成",
+        )
+        if response is None:
+            return await embedding_model.aembed_query(question)
+        hypothetical_doc = (response.content or "").strip()
         logger.debug(f"HyDE 假设文档: {hypothetical_doc[:100]}...")
         return await embedding_model.aembed_query(hypothetical_doc)
     except Exception as e:

@@ -15,7 +15,7 @@ from loguru import logger
 
 from src.core.persist_queue import PersistItem, enqueue
 from src.core.redaction import redact_text
-from src.core.tracing import current_trace
+from src.core.langfuse_tracing import current_trace
 
 
 class QueryAuditLog:

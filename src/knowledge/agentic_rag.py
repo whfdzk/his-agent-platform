@@ -20,6 +20,7 @@ from langchain_core.messages import SystemMessage
 from loguru import logger
 
 from src.knowledge.deps import KnowledgeDeps
+from src.knowledge.llm_call import ANSWER_TIMEOUT, call_llm_text
 
 DECIDE_TIMEOUT = 12.0
 JUDGE_TIMEOUT = 12.0
@@ -117,10 +118,10 @@ class AgenticResult:
 
 async def _ask_json(llm, prompt: str, timeout: float) -> dict | None:
     """让 LLM 输出 JSON；超时/解析失败返回 None，由调用方走降级路径。"""
-    try:
-        resp = await asyncio.wait_for(llm.ainvoke([SystemMessage(content=prompt)]), timeout=timeout)
-    except Exception as e:
-        logger.info(f"AgenticRAG 模型调用失败（{type(e).__name__}），走降级")
+    resp = await call_llm(
+        llm, [SystemMessage(content=prompt)], timeout=timeout, label="AgenticRAG 决策",
+    )
+    if resp is None:
         return None
     content = resp.content if isinstance(resp.content, str) else str(resp.content)
     content = content.strip()
@@ -324,10 +325,13 @@ async def run_agentic_rag(
 
     # 5. 生成回答
     context = _evidence_full(doc_hits, graph_records)
-    resp = await deps.llm.ainvoke([SystemMessage(content=ANSWER_PROMPT.format(
-        role=deps.role, question=question, context=context,
-    ))])
-    answer = resp.content if isinstance(resp.content, str) else str(resp.content)
+    answer = await call_llm_text(
+        deps.llm, [SystemMessage(content=ANSWER_PROMPT.format(
+            role=deps.role, question=question, context=context,
+        ))],
+        timeout=ANSWER_TIMEOUT, label="agentic 回答生成",
+        default="知识库已检索到相关资料，但生成回答超时，请稍后再问一次。",
+    )
 
     return AgenticResult(
         answer=answer,

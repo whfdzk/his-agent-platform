@@ -25,11 +25,16 @@ from pymilvus import MilvusClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import get_llm, get_settings
+from src.core.permissions import is_staff_role
 from src.infra.embedding import get_embeddings
 from src.infra.milvus_client import get_milvus_client
 from src.infra.neo4j_client import get_neo4j_driver
 
 settings = get_settings()
+
+# 工具型调用的输出上限：抽取/改写/打分/核查只需要几十个 token，
+# 放开上限时模型会把中间结果写成小作文（实测有 1,300 token 的打分输出）
+UTIL_MAX_TOKENS = 512
 
 
 class KnowledgeDeps:
@@ -44,8 +49,12 @@ class KnowledgeDeps:
         db_session: AsyncSession | None = None,
         user_id: str = "anonymous",
         role: str = "patient",
+        util_llm: BaseChatModel | None = None,
     ):
         self.llm = llm
+        # 工具型调用专用模型：关掉思考模式、限制输出长度。
+        # 最终回答仍用 self.llm（保留推理能力）。
+        self.util_llm = util_llm or llm
         self.embedding_model = embedding_model
         self.milvus_client = milvus_client
         self.neo4j_driver = neo4j_driver
@@ -55,8 +64,13 @@ class KnowledgeDeps:
 
     @property
     def is_staff(self) -> bool:
-        """运营/医生角色才允许走结构化数据（NL2SQL）。"""
-        return self.role in {"doctor", "pharmacist", "staff", "admin"}
+        """院内角色才允许走结构化数据（NL2SQL）。
+
+        口径与 core.permissions.STAFF_ROLES 保持一致：
+        以前这里手写了 {"doctor", "pharmacist", "staff", "admin"}，
+        登录签发的 clinician/nurse 反而被判成患者，运营查询永远拿不到数据。
+        """
+        return is_staff_role(self.role)
 
 
 _current_deps: ContextVar[KnowledgeDeps | None] = ContextVar("knowledge_deps", default=None)
@@ -120,6 +134,9 @@ async def build_knowledge_deps(
 
     return KnowledgeDeps(
         llm=get_llm(temperature=temperature),
+        util_llm=get_llm(
+            temperature=0.0, thinking=False, max_tokens=UTIL_MAX_TOKENS,
+        ),
         embedding_model=embedding_model,
         milvus_client=await _get_milvus_client(),
         neo4j_driver=_get_neo4j(),

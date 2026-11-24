@@ -10,14 +10,13 @@ tools/
 │   ├── _verify_tenant_isolation.py
 │   ├── _verify_history_event_type.py
 │   ├── _verify_c3_realtime.py
+│   ├── _verify_chat.py
 │   └── ...                # 含从根目录迁入的 _verify_band_*.py 等历史验收脚本
-├── probes/                # 一次性探针：验证某个假设，跑完即可弃
-│   ├── _probe_*.py        # 打接口 / 看模型返回 / 抓中间态
-│   ├── _check_*.py        # 查表、查配置、查数据
-│   ├── out/               # 探针输出（txt / json），已 gitignore
-│   └── assets/            # 探针用的音频素材（wav），已 gitignore
 └── README.md
 ```
+
+一次性探针（`_probe_*` / `_check_*`）已全部清理：链路观测统一到 Langfuse 后，
+抓中间态的临时脚本不再有长期价值，需要时现场写一个，跑完即删。
 
 配套目录：
 
@@ -29,25 +28,23 @@ tools/
 
 ## 运行方式
 
-脚本依赖项目根的 `src` 包，必须让项目根位于 `sys.path`。两种跑法等价：
-
-```powershell
-# 方式一：以模块方式运行（推荐，cwd 必须是项目根）
-& "D:\conda_envs\langchain1.2\python.exe" -m tools.probes._probe_drug_path
-
-# 方式二：显式把项目根加进 PYTHONPATH 后按路径运行
-$env:PYTHONPATH = "D:\github_xiangmu\his-agent-platform-main\his-agent-platform-main"
-& "D:\conda_envs\langchain1.2\python.exe" tools\probes\_probe_drug_path.py
-```
-
-`tools/verify/` 下的脚本已自带 `sys.path` 注入（项目根 = `parents[2]`），可直接按路径运行：
+脚本依赖项目根的 `src` 包，必须让项目根位于 `sys.path`。`tools/verify/` 下的脚本已自带
+`sys.path` 注入（项目根 = `parents[2]`），可直接按路径运行：
 
 ```powershell
 & "D:\conda_envs\langchain1.2\python.exe" tools\verify\_verify_tenant_isolation.py
+```
+
+新写的临时脚本（放在项目根，命名以 `_` 开头，已被 gitignore）需要手动把项目根加进 `PYTHONPATH`：
+
+```powershell
+$env:PYTHONPATH = "D:\github_xiangmu\his-agent-platform-main\his-agent-platform-main"
+& "D:\conda_envs\langchain1.2\python.exe" _my_probe.py
 ```
 
 ## 注意
 
 - 部分验收脚本会**写真实库**（建临时租户、造工单、改职称），跑完自行清理；详见各脚本头部注释与 `doc/2026-11-20-多租户多角色路线图落地差距审查.md`。
 - 登录相关脚本跑之前先清限流键，否则 5 次/5 分钟后会被 429 挡住：`scripts/ops/_reset_login_rate.py`。
-- 探针脚本是历史现场记录，参数（科室、医生、患者 id）可能已与当前数据不一致，复用前先读代码。
+- 查链路不再靠日志和探针：Langfuse UI（`http://localhost:3000`）按 `session_id` / `user_id` 过滤即可，
+  库里 `agent_traces` / `agent_spans` 两张表已经不再写入。

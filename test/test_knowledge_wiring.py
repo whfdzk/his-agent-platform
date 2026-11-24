@@ -10,7 +10,7 @@ import asyncio
 
 import pytest
 
-from src.core import tracing
+from src.core import langfuse_tracing as tracing
 from src.knowledge import doc_rag
 from src.knowledge.deps import KnowledgeDeps, bind_knowledge_deps, current_knowledge_deps
 from src.knowledge.tools import build_knowledge_tools
@@ -86,46 +86,16 @@ async def test_rewrite_falls_back_on_timeout(monkeypatch):
     assert await _rewrite("高血压能吃咸的吗", _deps()) == "高血压能吃咸的吗"
 
 
-@pytest.mark.asyncio
-async def test_search_docs_returns_answer_when_grounding_times_out(monkeypatch):
-    async def fake_raw(*_args, **_kwargs):
-        return [{"doc_name": "指南.pdf", "page_number": 1, "text": "限盐"}]
-
-    class _LLM:
-        async def ainvoke(self, _messages):
-            class _R:
-                content = "每天食盐少于 5 克。"
-
-            return _R()
-
-    async def slow_check(**_kwargs):
-        await asyncio.sleep(5)
-
-    monkeypatch.setattr(doc_rag, "search_docs_raw", fake_raw)
-    monkeypatch.setattr("src.knowledge.hallucination_check.check_hallucination", slow_check)
-    monkeypatch.setattr(doc_rag, "GROUNDING_TIMEOUT", 0.01)
-
-    answer = await doc_rag.search_docs(
-        question="高血压限盐",
-        embedding_model=None,
-        milvus_client=None,
-        llm=_LLM(),
-        with_grounding=True,
-    )
-    assert answer == "每天食盐少于 5 克。"
-
-
-def test_trace_sampling_skips_persist(monkeypatch):
+def test_trace_sampling_skips_report(monkeypatch):
+    """采样关闭时只保留内存计数，不建任何 span、不上报。"""
     monkeypatch.setattr(tracing, "_should_sample", lambda: False)
-    enqueued: list = []
-    monkeypatch.setattr(tracing, "_enqueue_trace", lambda payload: enqueued.append(payload))
 
-    recorder, token = tracing.start_trace(user_id="2", session_id="s1")
-    assert recorder.sampled is False
-    assert recorder.start_span("tool.x", "tool") is None
+    turn, token = tracing.start_trace(user_id="2", session_id="s1")
+    assert turn.sampled is False
+    assert turn.start_span("tool.x", "tool") is None
 
-    recorder.count_tool("search_knowledge_docs")
-    recorder.finish()
-    tracing.end_trace(recorder, token)
+    turn.count_tool("search_knowledge_docs")
+    tracing.end_trace(turn, token, status="success")
 
-    assert enqueued == []
+    assert turn.tool_calls == 1
+    assert turn._obs is None

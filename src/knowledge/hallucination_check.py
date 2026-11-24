@@ -15,6 +15,7 @@ from loguru import logger
 from langchain_core.messages import SystemMessage
 from langchain_core.language_models import BaseChatModel
 
+from src.knowledge.llm_call import UTIL_TIMEOUT, call_llm
 from src.knowledge.prompts import HALLUCINATION_CHECK_PROMPT
 
 
@@ -69,8 +70,14 @@ async def check_hallucination_enhanced(
     )
 
     try:
-        response = await llm.ainvoke([SystemMessage(content=prompt)])
-        content = response.content.strip()
+        response = await call_llm(
+            llm, [SystemMessage(content=prompt)],
+            timeout=UTIL_TIMEOUT, label="引用核查",
+        )
+        if response is None:
+            # 交给下面的 except 走 fail-closed（不可信 + 建议咨询医生）
+            raise RuntimeError(f"引用核查超时（{UTIL_TIMEOUT}s）")
+        content = (response.content or "").strip()
         if "```" in content:
             content = content.split("```")[1].lstrip("json").strip()
         result = json.loads(content)
