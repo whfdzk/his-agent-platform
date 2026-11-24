@@ -150,9 +150,14 @@ async def node_check_emergency(state: InquiryState, deps: InquiryDeps) -> dict:
             tenant_id=getattr(deps, "tenant_id", 1),
         )
 
+    # 黄档要落到具体科室，不能只说"相应专科门诊"（triage-06 类问题）
+    from src.agents.inquiry.department_hint import hint_department  # noqa: PLC0415
+
+    dept = hint_department(" ".join(symptoms or [])) if symptoms else hint_department(last_user_msg)
+
     return {
         "phase": InquiryPhase.END,
-        "messages": [AIMessage(content=emergency_reply(level, reason))],
+        "messages": [AIMessage(content=emergency_reply(level, reason, dept or ""))],
         "emergency_level": level,
     }
 

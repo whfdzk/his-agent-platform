@@ -77,8 +77,12 @@ def _stroke_red(text: str) -> bool:
     return (specific >= 1 and support >= 1) or specific >= 2
 
 
-def emergency_reply(level: str, reason: str = "") -> str:
-    """按等级给出就医指引：red 必须 120，orange 今日急诊，yellow 允许门诊。"""
+def emergency_reply(level: str, reason: str = "", department: str = "") -> str:
+    """按等级给出就医指引：red 必须 120，orange 今日急诊，yellow 允许门诊。
+
+    department 是症状→科室的确定性兜底（hint_department 给的空串就走原来的
+    "相应专科门诊"）。没有它时黄档只说"可以挂相应专科门诊"，患者仍然不知道挂哪个科。
+    """
     why = f"原因：{reason}\n\n" if reason else ""
     if level == LEVEL_RED:
         return (
@@ -94,10 +98,15 @@ def emergency_reply(level: str, reason: str = "") -> str:
             "**请立即前往最近医院的急诊科，或拨打 120。**\n\n"
             "如果途中症状加重（意识改变、呼吸困难、疼痛加剧），请直接拨打 120。"
         )
+    dept_line = (
+        f"**建议挂{department}门诊；如果夜间或周末症状明显加重，请直接去急诊科。**"
+        if department
+        else "**可以挂相应专科门诊；如果夜间或周末症状明显加重，请直接去急诊科。**"
+    )
     return (
         "您描述的症状不属于危急情况，但建议今天或明天尽快就医，不要拖到症状加重。\n\n"
         f"{why}"
-        "**可以挂相应专科门诊；如果夜间或周末症状明显加重，请直接去急诊科。**\n\n"
+        f"{dept_line}\n\n"
         "就诊时把症状开始时间、变化过程和正在服用的药物告诉医生。"
     )
 
@@ -193,8 +202,13 @@ async def gate(
             tenant_id=tenant_id,
         )
 
+    # 科室兜底：黄档要给出具体科室，不能只说"相应专科门诊"
+    from src.agents.inquiry.department_hint import hint_department  # noqa: PLC0415 —— 延迟导入避免循环依赖
+
+    dept = hint_department(" ".join(symptoms or [])) if symptoms else hint_department(text)
+
     return {
         "level": level,
         "reason": reason,
-        "reply": emergency_reply(level, reason),
+        "reply": emergency_reply(level, reason, dept or ""),
     }
