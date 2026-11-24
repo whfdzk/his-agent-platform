@@ -280,6 +280,10 @@ def build() -> dict:
             # 注意只对确实是急症的症状放宽，且用独立于产品 triage.TRIGGERS 的清单，
             # 免得用被测系统自己的定义来判它自己（循环论证）。
             expect = [d] + (["急诊", "120"] if s in RED_FLAG_SYMPTOMS else [])
+            # 出血倾向的规范就诊科室是血液科（medical.json 共现落在"内科"，
+            # 产品答"血液科"更准确，别让断言把更准的答案判错）
+            if s == "出血倾向" and "血液科" not in expect:
+                expect.append("血液科")
             cases.append({
                 "id": f"triage2-{s}-{idx}",
                 "category": "triage",
