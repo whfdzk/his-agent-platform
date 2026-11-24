@@ -179,7 +179,11 @@ async def main_async(args) -> None:
             scores[q] = rec
     if no_ref:
         ds2 = EvaluationDataset.from_list(no_ref)
-        from ragas.metrics import ContextPrecisionWithoutReference  # noqa: PLC0415
+        # ragas 0.4.4 里 collections 版要走 Instructor LLM，跟这里的 LangchainLLMWrapper
+        # 不兼容；旧的无参考版只剩私有名导出，按私有名取。
+        from ragas.metrics import (  # noqa: PLC0415
+            _LLMContextPrecisionWithoutReference as ContextPrecisionWithoutReference,
+        )
 
         res2 = evaluate(
             ds2,
@@ -237,6 +241,8 @@ async def main_async(args) -> None:
         "by_slice": by_slice,
         "details": out_rows,
     }
+    # 先存 Langfuse 再落盘，这样报告里能带上 trace_id 方便回溯
+    summary["langfuse_trace_id"] = archive_to_langfuse(summary)
     out_path = Path(args.out) if args.out else ROOT / "doc" / "eval-reports" / (
         f"ragas-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
     )
@@ -254,6 +260,102 @@ async def main_async(args) -> None:
         if v is not None:
             print(f"  {k:34} {v}")
     print(f"写入 {out_path}")
+
+
+def archive_to_langfuse(summary: dict) -> str | None:
+    """把四指标汇总推到自托管 Langfuse：一条 trace + 每个指标一条 score。
+
+    直接走公开 ingestion 接口（trace-create / score-create），避免 SDK 大版本差异。
+    存档失败只打印原因，不影响评估本身。
+    """
+    env = read_env()
+    if (env.get("LANGFUSE_ENABLED") or "").lower() not in ("1", "true", "yes"):
+        print("Langfuse：未启用（LANGFUSE_ENABLED 不为真），跳过存档")
+        return None
+    pk = env.get("LANGFUSE_PUBLIC_KEY")
+    sk = env.get("LANGFUSE_SECRET_KEY")
+    base = (env.get("LANGFUSE_BASE_URL") or "").rstrip("/")
+    if not (pk and sk and base):
+        print("Langfuse：缺 PUBLIC_KEY / SECRET_KEY / BASE_URL，跳过存档")
+        return None
+    try:
+        import uuid  # noqa: PLC0415
+
+        import httpx  # noqa: PLC0415
+    except Exception as e:  # pragma: no cover
+        print(f"Langfuse：httpx 不可用，跳过存档（{type(e).__name__}）")
+        return None
+
+    now_iso = datetime.now().astimezone().isoformat(timespec="seconds")
+    trace_id = str(uuid.uuid4())
+    scores = summary.get("aggregate") or {}
+    slice_tags = ",".join(sorted((summary.get("by_slice") or {}).keys())) or "all"
+    name = f"ragas-4metrics-{summary.get('ragas_slices', 'kb,drug')}-{summary.get('rows', 0)}"
+
+    batch: list[dict] = [
+        {
+            "id": str(uuid.uuid4()),
+            "type": "trace-create",
+            "timestamp": now_iso,
+            "body": {
+                "id": trace_id,
+                "name": name,
+                "timestamp": now_iso,
+                "environment": env.get("LANGFUSE_ENVIRONMENT") or "dev",
+                "input": {
+                    "report": summary.get("report"),
+                    "slices": summary.get("ragas_slices"),
+                    "rows": summary.get("rows"),
+                    "with_reference": summary.get("with_reference"),
+                },
+                "output": {
+                    "aggregate": scores,
+                    "by_slice": summary.get("by_slice"),
+                },
+                "metadata": {
+                    "framework": summary.get("framework"),
+                    "slice_tags": slice_tags,
+                    "details": summary.get("details"),
+                },
+                "tags": ["ragas", "eval", *[s for s in (summary.get("ragas_slices") or "").split(",") if s]],
+            },
+        }
+    ]
+    for k, v in scores.items():
+        if v is None:
+            continue
+        score_id = str(uuid.uuid4())
+        batch.append(
+            {
+                "id": score_id,
+                "type": "score-create",
+                "timestamp": now_iso,
+                "body": {
+                    "id": score_id,
+                    "traceId": trace_id,
+                    "name": k,
+                    "value": float(v),
+                    "dataType": "NUMERIC",
+                    "environment": env.get("LANGFUSE_ENVIRONMENT") or "dev",
+                    "comment": f"{summary.get('rows', 0)} 条样本，切片 {summary.get('ragas_slices')}",
+                },
+            }
+        )
+
+    try:
+        with httpx.Client(timeout=20) as client:
+            resp = client.post(
+                f"{base}/api/public/ingestion",
+                auth=(pk, sk),
+                json={"batch": batch},
+            )
+        if resp.status_code in (200, 201, 207):
+            print(f"Langfuse：已存档 trace={trace_id}（{len(batch) - 1} 个指标）")
+            return trace_id
+        print(f"Langfuse：存档返回 {resp.status_code} {resp.text[:200]}")
+    except Exception as e:  # pragma: no cover
+        print(f"Langfuse：存档失败（{type(e).__name__}: {e}）")
+    return None
 
 
 def main() -> None:
