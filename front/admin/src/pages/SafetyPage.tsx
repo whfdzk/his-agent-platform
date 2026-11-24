@@ -87,12 +87,10 @@ export function SafetyPage() {
   };
 
   const purge = async () => {
-    if (!window.confirm('将按保留周期清理过期轨迹与安全事件，确定执行？')) return;
+    if (!window.confirm('将按保留周期清理过期安全事件（链路轨迹由 Langfuse 自行管理），确定执行？')) return;
     try {
       const res = await observabilityApi.purge();
-      setMessage(
-        `已清理 span ${res.deleted_spans} 条、trace ${res.deleted_traces} 条、安全事件 ${res.deleted_safety_events} 条`,
-      );
+      setMessage(`已清理安全事件 ${res.deleted_safety_events} 条`);
     } catch (e) {
       setMessage((e as Error).message || '清理失败');
     }

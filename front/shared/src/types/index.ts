@@ -255,15 +255,6 @@ export interface TraceItem {
   latency_ms: number;
 }
 
-export interface AgentTrace {
-  turn_id: string;
-  session_id: string | null;
-  user_id: string | null;
-  created_at: string | null;
-  total_tokens: number;
-  items: TraceItem[];
-}
-
 // ── 登录 / 注册 ───────────────────────────────────────────────────────
 
 export interface AuthUser {
@@ -540,67 +531,6 @@ export interface DataRequestItem {
   note: string | null;
   created_at: string | null;
   expires_at: string | null;
-}
-
-// ── 管理端：全链路追踪 ─────────────────────────────────────────────────
-
-export interface TraceSpanItem {
-  span_id: string;
-  parent_span_id: string | null;
-  name: string;
-  kind: 'api' | 'agent' | 'tool' | 'llm' | 'retrieval' | 'safety' | 'final_response' | 'persistence';
-  agent_name: string | null;
-  agent_version: string | null;
-  tool_name: string | null;
-  model_name: string | null;
-  model_version: string | null;
-  status: string;
-  error_type: string | null;
-  latency_ms: number;
-  tokens: { prompt: number; completion: number; total: number };
-  attributes: Record<string, unknown>;
-  created_at: string | null;
-}
-
-export interface TraceListItem {
-  trace_id: string;
-  request_id: string;
-  user_id: string;
-  session_id: string;
-  turn_id: string;
-  entrypoint: string;
-  agent_name: string;
-  agent_version: string;
-  prompt_version: string;
-  model_name: string;
-  model_version: string;
-  status: string;
-  error_type: string | null;
-  latency_ms: number;
-  tokens: { prompt: number; completion: number; total: number };
-  tool_calls: number;
-  tool_names: string[];
-  agent_calls: number;
-  retrieval: { count: number; sources: Record<string, unknown>[] };
-  safety: { level: string; result: string; rules: string[] };
-  input_chars: number;
-  output_chars: number;
-  created_at: string | null;
-}
-
-export interface ObservabilityStats {
-  days: number;
-  total: number;
-  errors: number;
-  blocked: number;
-  error_rate: number;
-  avg_latency_ms: number;
-  total_tokens: number;
-  avg_tool_calls: number;
-  avg_retrieval: number;
-  by_agent: { agent: string; count: number; avg_latency_ms: number; tokens: number }[];
-  by_model: { model: string; count: number; tokens: number }[];
-  safety_distribution: { level: string; count: number }[];
 }
 
 // ── 管理端：Safety Engine ──────────────────────────────────────────────

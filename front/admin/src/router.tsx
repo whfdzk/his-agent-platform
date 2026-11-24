@@ -6,7 +6,6 @@ import { DashboardPage } from './pages/DashboardPage';
 import { TokenUsagePage } from './pages/TokenUsagePage';
 import { KnowledgePage } from './pages/KnowledgePage';
 import { ModelConfigsPage } from './pages/ModelConfigsPage';
-import { TracesPage } from './pages/TracesPage';
 import { SafetyPage } from './pages/SafetyPage';
 import { UsersPage } from './pages/UsersPage';
 import { AgentsPage } from './pages/AgentsPage';
@@ -39,9 +38,8 @@ export const router = createBrowserRouter([
           { path: 'knowledge', element: <KnowledgePage /> },
           { path: 'conversations', element: <ConversationsPage /> },
           { path: 'system', element: <SystemConfigPage /> },
-          // 审计与扩展
+          // 审计与扩展（链路轨迹查 Langfuse UI，不在管理端内嵌页面）
           { path: 'safety', element: <SafetyPage /> },
-          { path: 'traces', element: <TracesPage /> },
           // P1 / P2
           { path: 'tokens', element: <TokenUsagePage /> },
           { path: 'members', element: <MembersPage /> },

@@ -14,7 +14,6 @@ import {
   LogOut,
   Menu,
   MessagesSquare,
-  Route,
   Settings2,
   ShieldAlert,
   Stethoscope,
@@ -52,7 +51,6 @@ const navGroups: { label: string; items: { to: string; label: string; icon: type
     label: '审计与扩展',
     items: [
       { to: '/safety', label: '风险审计', icon: ShieldAlert },
-      { to: '/traces', label: 'Agent 轨迹', icon: Route },
       { to: '/members', label: '会员管理', icon: CreditCard },
     ],
   },

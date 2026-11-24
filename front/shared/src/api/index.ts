@@ -1,7 +1,6 @@
 import type {
   Appointment,
   AppointmentData,
-  AgentTrace,
   AgentStatus,
   AgentUpsert,
   AdminAgent,
@@ -38,7 +37,6 @@ import type {
   ModelConfig,
   ModelConfigUpsert,
   ModelType,
-  ObservabilityStats,
   PromptVersionItem,
   PatientOverview,
   PendingChatEvent,
@@ -48,8 +46,6 @@ import type {
   SystemConfigItem,
   SystemConfigUpsert,
   SystemLimits,
-  TraceListItem,
-  TraceSpanItem,
   ProfileUpdate,
   RegisterRequest,
   ReminderItem,
@@ -244,7 +240,7 @@ export const modelConfigApi = {
   chain: () => request<{ chain: FailoverChainItem[]; total: number }>('/model-configs/chain'),
 };
 
-// ── 统计 / 轨迹 ────────────────────────────────────────────────────────
+// ── 统计 ───────────────────────────────────────────────────────────────
 
 export const statsApi = {
   tokens: (params: {
@@ -254,9 +250,6 @@ export const statsApi = {
     session_id?: string;
     user_id?: string;
   }) => request<{ groups: TokenUsageGroup[]; total: number }>('/stats/tokens', { params }),
-
-  traces: (params: { session_id?: string; user_id?: string; worker?: string; limit?: number; offset?: number }) =>
-    request<{ traces: AgentTrace[]; total: number }>('/traces', { params }),
 
   consultations: (days = 30) =>
     request<ConsultationStats>('/stats/consultations', { params: { days } }),
@@ -337,50 +330,34 @@ export const reportApi = {
     request<ReportCompare>('/patient/reports/compare', { params }),
 };
 
-// ── 管理端：全链路追踪 ─────────────────────────────────────────────────
+// ── 管理端：运维观测（链路轨迹已统一到 Langfuse，这里只剩业务侧指标） ────
 
 export const observabilityApi = {
-  traces: (params: {
-    trace_id?: string;
-    user_id?: string;
-    session_id?: string;
-    agent_name?: string;
-    status?: string;
-    safety_level?: string;
-    days?: number;
-    limit?: number;
-    offset?: number;
-  }) => request<{ traces: TraceListItem[]; total: number }>('/observability/traces', { params }),
-
-  traceDetail: (traceId: string) =>
-    request<{
-      trace: TraceListItem | null;
-      spans: TraceSpanItem[];
-      events: { id: number; stage: string; level: string; action: string; rule_id: string; review_status: string; snippet: string | null; created_at: string | null }[];
-    }>(`/observability/traces/${traceId}`),
-
-  stats: (days = 7) => request<ObservabilityStats>('/observability/stats', { params: { days } }),
-
   retention: () =>
     request<{
-      traces: number;
-      spans: number;
-      oldest_trace_at: string | null;
+      trace_store: string;
+      safety_events: number;
+      oldest_safety_event_at: string | null;
       pending_safety_reviews: number;
-      trace_retention_days: number;
       safety_event_retention_days: number;
       access_log_retention_days: number;
     }>('/observability/retention'),
 
   purge: () =>
     request<{
-      deleted_spans: number;
-      deleted_traces: number;
+      trace_store: string;
       deleted_safety_events: number;
-      trace_retention_days: number;
       safety_event_retention_days: number;
       access_log_retention_days: number;
     }>('/observability/retention/purge', { method: 'POST' }),
+
+  onlineMetrics: (days = 7) =>
+    request<{
+      days: number;
+      conversations: number;
+      handoff_rate: number;
+      repeat_question_rate: number;
+    }>('/observability/online-metrics', { params: { days } }),
 };
 
 // ── 管理端：Safety Engine ──────────────────────────────────────────────
