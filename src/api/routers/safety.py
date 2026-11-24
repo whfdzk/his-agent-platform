@@ -19,7 +19,7 @@ from src.core.config import get_settings
 from src.core.exceptions import BizErrorCode, BizException
 from src.core.safety import safety_engine
 from src.infra.database import get_db
-from src.modules.ops.trace_model import SafetyEvent
+from src.modules.ops.safety_model import SafetyEvent
 
 router = APIRouter(
     prefix="/api/v1/safety",

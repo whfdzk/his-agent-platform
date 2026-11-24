@@ -23,6 +23,7 @@ from src.agents.inquiry.neo4j_queries import (
     query_candidate_diseases, enrich_candidate_details, get_pending_symptoms
 )
 from src.agents.inquiry.confidence import apply_context_weights, check_convergence
+from src.agents.inquiry.department_hint import hint_department
 from src.agents.inquiry.prompts import (
     CLARIFY_PROMPT, ASK_SYMPTOMS_PROMPT, PARSE_ANSWER_PROMPT, CONCLUSION_PROMPT
 )
@@ -127,7 +128,7 @@ async def node_check_emergency(state: InquiryState, deps: InquiryDeps) -> dict:
     patient_id = state.patient_context.patient_id if state.patient_context else None
     user_id = str(patient_id) if patient_id else "anon"
     try:
-        from src.core.tracing import get_trace_id
+        from src.core.langfuse_tracing import get_trace_id
 
         trace_id = get_trace_id()
     except Exception:  # noqa: BLE001 —— 追踪不可用不影响落库
@@ -194,6 +195,17 @@ async def node_extract_symptoms(state: InquiryState, deps: InquiryDeps) -> dict:
             "confirmed_symptoms": new_confirmed,
             "unmatched_symptoms": new_unmatched,
             "phase": InquiryPhase.GRAPH_QUERY, # 接下来进入哪个阶段
+        }
+    elif state.confirmed_symptoms:
+        # 本轮没提取到新症状，但前几轮已经确认过症状：
+        # 患者这轮说的是"其他没有了""就直接告诉我挂哪科"这类收尾话，
+        # 原逻辑会落进 CLARIFY，把已经积累的症状和候选疾病一起丢掉，
+        # 再反问一遍"具体哪个部位、多久了"——多轮对话因此原地打转。
+        # 已经确认过症状就直接回图谱重算，让流程能往结论走。
+        logger.info("节点③症状标准化 本轮无新症状，沿用已确认症状继续 | 累计确认={}", state.confirmed_symptoms)
+        return {
+            "unmatched_symptoms": new_unmatched,
+            "phase": InquiryPhase.GRAPH_QUERY,
         }
     else:
         logger.info("节点③症状标准化 无法提取明确症状，进入澄清流程")
@@ -271,12 +283,40 @@ async def node_query_neo4j(state: InquiryState, deps: InquiryDeps) -> dict:
         }
 
 
+# 用户明确要求"别追问、直接给结论"的信号词。
+# 只在上一轮已经追问过（round>=1）时生效：首轮本来就在问"该挂什么科"，
+# 若首轮就收口会让普通问诊少掉关键澄清。
+_DIRECT_ANSWER_HINTS = (
+    "直接告诉", "直接说", "别问", "不用再问", "不要追问", "就别问了", "直接给",
+)
+
+
+def _last_user_message(state: InquiryState) -> str:
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            return msg.content or ""
+    return ""
+
+
+def _wants_direct_answer(state: InquiryState) -> bool:
+    if state.round < 1:
+        return False
+    return any(k in _last_user_message(state) for k in _DIRECT_ANSWER_HINTS)
+
+
 async def node_ask_symptoms(state: InquiryState, deps: InquiryDeps) -> dict:
     """
     节点⑥：生成追问话术。
     从候选疾病中选出区分度最高的 ≤3 个症状，口语化后追问用户。
     """
     logger.info("节点⑥生成追问话术 生成追问 | round={} 已问症状={}", state.round, state.asked_symptoms)
+    if _wants_direct_answer(state):
+        # 被追问过一轮后用户说"别问了，直接告诉我挂哪个科"：再问就是体验问题，
+        # 直接收敛，科室由结论节点按症状兜底（见 department_hint）
+        logger.info("节点⑥生成追问话术 用户要求直接给结论，跳过追问")
+        # 证据链没走完：按 force_conclude 处理，结论节点会降级为"证据不足 + 科室建议"，
+        # 不会硬给一个病名
+        return {"phase": InquiryPhase.CONCLUDE, "force_conclude": True}
     pending = await get_pending_symptoms(
         candidates=state.candidate_diseases,
         confirmed_symptoms=state.confirmed_symptoms,
@@ -364,12 +404,16 @@ async def node_conclude(state: InquiryState, deps: InquiryDeps) -> dict:
     整合所有信息，生成用户可读的结论文案，并构建 HandoffPayload。
     """
     candidates = state.candidate_diseases
+    # 低置信度兜底用的症状文本：已确认 + 未匹配上的，都要参与"症状→科室"判断
+    symptom_text = "、".join(list(state.confirmed_symptoms) + list(state.unmatched_symptoms))
     if not candidates:
         logger.warning("节点⑧生成诊断结论 无候选疾病，返回无结果提示")
+        hint = hint_department(symptom_text) or hint_department(state.session_id or "")
+        dept_line = f"建议先挂{hint}就诊，由医生面诊判断；" if hint else "建议先挂全科/普通内科"
         no_result_msg = (
             "根据您描述的症状，我暂时无法在知识库中找到匹配的疾病。\n\n"
             "这可能是因为症状较为罕见，或者需要更多信息。\n"
-            "建议您直接前往医院就诊，由医生进行面诊。"
+            f"{dept_line}必要时到医院进一步检查。"
         )
         return {
             "phase": InquiryPhase.END,
@@ -391,7 +435,10 @@ async def node_conclude(state: InquiryState, deps: InquiryDeps) -> dict:
     )
     diagnosis_guidance = "证据不足" if low_confidence else "可给出主诊断"
     display_disease = top1.name if not low_confidence else "暂无明确结论"
-    display_dept = (top1.department or "综合内科") if not low_confidence else "综合内科"
+    # 低置信度时的科室：先看症状本身指向哪里（红疹→皮肤科、眼痛→眼科），
+    # 再退回"综合内科"。图谱给的明确科室（高置信度）不受影响。
+    hint = hint_department(symptom_text) if low_confidence else ""
+    display_dept = (top1.department or "综合内科") if not low_confidence else (hint or "综合内科")
     display_checks = top1.checks[:5] if not low_confidence else []
     logger.info("节点⑧生成诊断结论 生成诊断结论 | 主诊断={} 置信度={:.3f} 科室={} 口径={} 疑似={}",
                 display_disease, top1.confidence, display_dept, diagnosis_guidance, suspected)

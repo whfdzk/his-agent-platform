@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from dataclasses import dataclass
 
@@ -48,7 +49,8 @@ from src.core.safety import record_safety_event, safety_engine
 from src.core.llm_guard import scrub_for_llm
 from src.core.persist_queue import PersistItem, enqueue
 from src.core.redaction import redact_phi
-from src.core.tracing import end_trace, start_trace, trace_span
+from src.core.agent_registry import get_active_config
+from src.core.langfuse_tracing import end_trace, start_trace, trace_span
 from src.api.rate_limit import enforce_user_message_rate
 from src.api.deps import (
     ANON_USER_ID,
@@ -114,6 +116,8 @@ class ChatIdentity:
     patient_id: int | None        # 患者档案 ID（游客为 None）
     # C1：会话/消息必须写到患者所属租户。游客不落库，默认租户即可
     tenant_id: int = DEFAULT_TENANT_ID
+    # 角色：决定工具面（如运营数据仅院内角色可用）。游客/患者默认 patient
+    role: str = "patient"
 
     @property
     def persist(self) -> bool:
@@ -138,6 +142,7 @@ def _resolve_identity(ctx: AuthContext | None, request: Request) -> ChatIdentity
             rate_key=f"user:{ctx.subject_id}",
             patient_id=patient_id,
             tenant_id=ctx.tenant_id,
+            role=str(getattr(ctx, "role", "") or "patient"),
         )
     ip = request.client.host if request.client else "unknown"
     return ChatIdentity(
@@ -155,6 +160,25 @@ def _thread_id(identity: ChatIdentity, session_id: str) -> str:
     会话彼此仍由 session_id 隔离，短期记忆互不串扰。
     """
     return f"{identity.user_id}:{session_id}"
+
+
+def _trace_metadata() -> dict[str, str]:
+    """本轮 trace 的版本信息：回答"这次到底用的是哪套配置"。
+
+    只放真实值：prompts 表为空（当前都是内联 system_prompt）时 prompt_version 留空，
+    不编造版本号。config_revision 是 agents 表的 updated_at，配置改过就能对上时间。
+    """
+    try:
+        cfg = get_active_config("supervisor")
+    except Exception:  # 配置还没加载完也不能让聊天挂掉
+        return {}
+    return {
+        "config_revision": cfg.revision or "",
+        "config_status": cfg.status or "",
+        "prompt_version": cfg.prompt_version or "",
+        "model": cfg.model or getattr(settings, "CHAT_MODEL", "") or "",
+        "max_turns": str(cfg.max_turns or ""),
+    }
 
 
 # ── SSE 工具 ──────────────────────────────────────────────────────────────
@@ -412,6 +436,59 @@ async def _run_inquiry_turn(
 
 
 # ── 非流式接口 ────────────────────────────────────────────────────────────
+async def _dispatch_reply(
+    *,
+    llm_message: str,
+    identity: ChatIdentity,
+    user_id: str,
+    session_id: str,
+    thread_id: str,
+    handler,
+) -> tuple[str, str]:
+    """入口分流：单域药品/知识问题直连 worker，其余交给 supervisor 编排。
+
+    直连省掉的是 supervisor 那次"再判断要不要换助手"的模型调用（实测 r5-1 里
+    它一轮调了 13 次，在 drug / knowledge 之间来回派单，直到撞上 recursion_limit）。
+    问诊、报告、健康、就医、运营仍走 supervisor：它们有多轮状态与确认卡片，
+    直连会丢掉这些副作用。
+    """
+    from src.agents.direct_worker import SUPPORTED_AGENTS, run_direct_worker
+    from src.agents.router import route_message
+
+    decision = await route_message(llm_message)
+    if decision.mode == "single" and decision.agent in SUPPORTED_AGENTS:
+        reply = await run_direct_worker(
+            decision.agent,
+            llm_message,
+            user_id=user_id,
+            session_id=session_id,
+            role=identity.role,
+            tenant_id=identity.tenant_id,
+            authenticated=identity.authenticated,
+            patient_id=identity.patient_id,
+            thread_id=thread_id,
+            handler=handler,
+        )
+        logger.info(f"[router] 直连 {decision.agent}（{decision.reason}）")
+        return reply, f"direct:{decision.agent}"
+
+    agent = await get_supervisor_agent()
+    config = {"configurable": {"thread_id": thread_id}, "callbacks": [handler]}
+    result = await guarded(agent.ainvoke(
+        {"messages": [{"role": "user", "content": llm_message}]},
+        config=config,
+        context=UserContext(
+            user_id=user_id,
+            session_id=session_id,
+            authenticated=identity.authenticated,
+            patient_id=identity.patient_id,
+            tenant_id=identity.tenant_id,
+            role=identity.role,
+        ),
+    ))
+    reply = result["messages"][-1].content
+    return (reply if isinstance(reply, str) else str(reply)), "supervisor"
+
 @router.post("", response_model=ChatResponse)
 async def chat(
     req: ChatRequest,
@@ -443,6 +520,21 @@ async def chat(
         raise BizException(BizErrorCode.CONFLICT, "上一条消息仍在处理中，请稍候", status_code=409)
 
     handler = make_usage_handler(user_id, req.session_id, tenant_id=identity.tenant_id)
+
+    # 全链路追踪：Langfuse 未配置时整层 no-op，业务侧无感知。
+    # 只包"处理一轮消息"这段，落库/幂等在 trace 外，避免把 IO 时间算进模型耗时。
+    turn, trace_token = start_trace(
+        request_id=request_id_var.get(""),
+        user_id=user_id,
+        session_id=req.session_id,
+        turn_id=handler.turn_id,
+        entrypoint="/api/v1/chat",
+        agent_name="supervisor",
+        input_text=llm_message,
+        metadata=_trace_metadata(),
+    )
+    turn.input_chars = len(llm_message)
+    route_tag = "agent"
     try:
         # B3：急症闸门优先于一切业务判定 —— 红旗症状先分级落库，直接给急诊指引
         _emergency = await _emergency_gate(
@@ -454,6 +546,14 @@ async def chat(
         )
         if _emergency:
             reply = _emergency["reply"]
+            turn.extra.update({
+                "route": "emergency_gate",
+                "level": _emergency.get("level"),
+                "thread_id": thread_id,
+                "tenant_id": identity.tenant_id,
+                "authenticated": identity.authenticated,
+            })
+            turn.output_text = reply
             await redis.delete(f"inquiry_state:{thread_id}")
             await _idem_store_result(redis, user_id, req.client_message_id, reply, None)
             return ChatResponse(
@@ -492,22 +592,14 @@ async def chat(
                     tenant_id=identity.tenant_id,
                 ))
             else:
-                agent = await get_supervisor_agent()
-                config = {"configurable": {"thread_id": thread_id}, "callbacks": [handler]}
-                result = await guarded(agent.ainvoke(
-                    {"messages": [{"role": "user", "content": llm_message}]},
-                    config=config,
-                    context=UserContext(
-                        user_id=user_id,
-                        session_id=req.session_id,
-                        authenticated=identity.authenticated,
-                        patient_id=identity.patient_id,
-                        tenant_id=identity.tenant_id,
-                    ),
-                ))
-                reply = result["messages"][-1].content
-                if not isinstance(reply, str):
-                    reply = str(reply)
+                reply, route_tag = await _dispatch_reply(
+                    llm_message=llm_message,
+                    identity=identity,
+                    user_id=user_id,
+                    session_id=req.session_id,
+                    thread_id=thread_id,
+                    handler=handler,
+                )
         elif await redis.exists(f"inquiry_active:{thread_id}"):
             reply, _appt, _clarify = await guarded(_run_inquiry_turn(
                 llm_message, thread_id, redis, user_id=user_id, callbacks=[handler],
@@ -515,22 +607,14 @@ async def chat(
                 tenant_id=identity.tenant_id,
             ))
         else:
-            agent = await get_supervisor_agent()
-            config = {"configurable": {"thread_id": thread_id}, "callbacks": [handler]}
-            result = await guarded(agent.ainvoke(
-                {"messages": [{"role": "user", "content": llm_message}]},
-                config=config,
-                context=UserContext(
-                    user_id=user_id,
-                    session_id=req.session_id,
-                    authenticated=identity.authenticated,
-                    patient_id=identity.patient_id,
-                    tenant_id=identity.tenant_id,
-                ),
-            ))
-            reply = result["messages"][-1].content
-            if not isinstance(reply, str):
-                reply = str(reply)
+            reply, route_tag = await _dispatch_reply(
+                llm_message=llm_message,
+                identity=identity,
+                user_id=user_id,
+                session_id=req.session_id,
+                thread_id=thread_id,
+                handler=handler,
+            )
 
         await _persist_message(
             redis, identity, req.session_id, role="user",
@@ -542,16 +626,30 @@ async def chat(
             content=reply, turn_id=handler.turn_id, persist=identity.persist,
         )
         await _idem_store_result(redis, user_id, req.client_message_id, reply, None)
+        turn.extra.update({
+            "route": route_tag,
+            "thread_id": thread_id,
+            "tenant_id": identity.tenant_id,
+            "authenticated": identity.authenticated,
+        })
+        turn.output_text = reply
         return ChatResponse(
             reply=reply, session_id=req.session_id,
             authenticated=identity.authenticated,
         )
     except BizException:
         raise
-    except Exception:
+    except Exception as e:
+        turn.status = "error"
+        turn.error_type = type(e).__name__
         logger.exception("chat 接口异常")
         raise BizException(BizErrorCode.INTERNAL, "服务内部错误，请稍后重试", status_code=500) from None
     finally:
+        # 收尾 trace（内部只做一次 flush，不阻塞），再放锁
+        try:
+            end_trace(turn, trace_token, status=turn.status, error_type=turn.error_type)
+        except Exception:
+            pass
         await redis.delete(f"lock:turn:{thread_id}")
 
 
@@ -700,7 +798,7 @@ async def _emergency_gate(
     这里先分级落库再回指引，保证"患者看到急诊提示"和"库里有一条分级记录"同时成立。
     """
     try:
-        from src.core.tracing import get_trace_id
+        from src.core.langfuse_tracing import get_trace_id
 
         trace_id = get_trace_id()
     except Exception:  # noqa: BLE001 —— 追踪不可用不影响分级
@@ -855,6 +953,7 @@ async def _stream_supervisor_turn_events(
     # guarded_stream：整段流式持有 LLM 信号量并限制总耗时，
     # 否则流式主链路会绕过 LLM_MAX_CONCURRENCY 直接打爆上游网关
     json_guard: dict[str, bool] = {}
+    narration = _NarrationFilter()
     async for chunk in guarded_stream(
         agent.astream(
             {"messages": [{"role": "user", "content": message}]},
@@ -866,6 +965,7 @@ async def _stream_supervisor_turn_events(
                 authenticated=identity.authenticated,
                 patient_id=identity.patient_id,
                 tenant_id=identity.tenant_id,
+                role=identity.role,
             ),
         )
     ):
@@ -900,7 +1000,147 @@ async def _stream_supervisor_turn_events(
                 json_guard[mid] = content.lstrip().startswith(("{", "```json"))
             if json_guard[mid]:
                 continue
-            await queue.put({"type": "token", "content": content})
+            for piece in narration.feed(mid, content):
+                await queue.put({"type": "token", "content": piece})
+
+    for piece in narration.flush():
+        await queue.put({"type": "token", "content": piece})
+
+
+_NARRATION_LEAD = re.compile(
+    r"^\s*[*#>\-\s|]*"                                        # 可选 markdown 前缀
+    r"(?:(?:好的|好|嗯|稍等)[，,、。！!]?\s*)?"                 # 可选口头语
+    r"(?:我|让我|咱们|下面|接下来)"                             # 主语
+    r"(?:先|再|来|会|将|马上|现在|立即|同时|分别|逐一){0,3}"
+    r"(?:为您|给您|帮您|为你)?"
+    r"(?:查询|检索|查找|搜索|查看|调取|核对|确认|核实|获取|拉取|调阅)"
+)
+_SENT_END = "。！!？?\n"
+
+
+class _NarrationFilter:
+    """把"我来查一下…""我来同时检索…"这类过程旁白从流里摘掉。
+
+    为什么不能等 tool_calls 出现再跳：模型是先吐一句旁白、后面几个 chunk 才带
+    tool_calls，等看到 tool_calls 时旁白早就推给前端了（线上 kb-03/kb-04 就是这样
+    把「我来查询相关权威资料。」留在答案开头的）。
+
+    做法：每条消息只缓冲开头一句，命中旁白整句丢、继续看下一句；判不出旁白就
+    连缓冲一起原样下发。只影响开头几十个字符，之后直通，token 级流式不受影响。
+    """
+
+    def __init__(self, max_buffer: int = 120) -> None:
+        self._max = max_buffer
+        self._state: dict[str, list] = {}  # mid -> [mode, buffer]，mode: pending | pass
+
+    def feed(self, mid: str, text: str) -> list[str]:
+        st = self._state.setdefault(mid, ["pending", ""])
+        if st[0] == "pass":
+            return [text]
+        buf = st[1] + text
+        while st[0] == "pending":
+            cut = -1
+            for i, ch in enumerate(buf):
+                if ch in _SENT_END:
+                    cut = i
+                    break
+            if cut < 0:
+                if len(buf) >= self._max:  # 迟迟没有句末标点，别卡住首个 token
+                    st[0] = "pass"
+                    st[1] = ""
+                    return [buf]
+                st[1] = buf
+                return []
+            head = buf[: cut + 1]
+            if _NARRATION_LEAD.match(head):
+                buf = buf[cut + 1:].lstrip()
+                continue  # 是旁白，丢掉后继续看下一句是否还在叙述
+            break
+        st[0] = "pass"
+        st[1] = ""
+        return [buf] if buf else []
+
+    def flush(self) -> list[str]:
+        """流结束时把还压在缓冲里的正文放出来（末句没标点的情况）。"""
+        out: list[str] = []
+        for st in self._state.values():
+            if st[0] == "pending" and st[1] and not _NARRATION_LEAD.match(st[1]):
+                out.append(st[1])
+            st[0] = "pass"
+            st[1] = ""
+        return out
+
+
+async def _stream_direct_turn_events(
+    code: str,
+    message: str,
+    thread_id: str,
+    handler,
+    identity: ChatIdentity,
+    user_id: str,
+    session_id: str,
+    queue: asyncio.Queue,
+) -> None:
+    """单域直连的流式分支：只把"最终答案"那条消息按 token 推给前端。
+
+    过滤依据实测（416 个 chunk 的元数据）：worker 图里只有两类 chunk 会带正文——
+    - langgraph_node == "tools"：工具内部的模型调用（实体抽取的 JSON、检索改写）
+      以及工具回填的原文片段，属于中间素材，推出去就是"同一答案两遍"；
+    - langgraph_node == "model" 且 content 非空、无 tool_calls：模型正在写最终回答。
+    注意不能按 lc_agent_name 过滤：直连 worker 自身就叫 drug_agent / knowledge_agent，
+    按它过滤会把整条流都滤掉（supervisor 路径能用，是因为那里只有子 agent 带 name）。
+    """
+    from src.agents.direct_worker import stream_direct_worker
+
+    json_guard: dict[str, bool] = {}
+    narration = _NarrationFilter()
+    emitted = 0
+    try:
+        async for item in guarded_stream(
+            stream_direct_worker(
+                code,
+                message,
+                user_id=user_id,
+                session_id=session_id,
+                role=identity.role,
+                tenant_id=identity.tenant_id,
+                authenticated=identity.authenticated,
+                patient_id=identity.patient_id,
+                thread_id=thread_id,
+                handler=handler,
+            )
+        ):
+            if not isinstance(item, tuple):
+                continue
+            msg, meta = item
+            meta = meta or {}
+            if meta.get("langgraph_node") != "model":
+                continue
+            if getattr(msg, "tool_calls", None):
+                continue
+            content = msg.content if isinstance(msg.content, str) else ""
+            if not content:
+                continue
+            # 模型"预演"的工具参数 JSON 不能被当正文推出去（同上 supervisor 路径的处理）
+            mid = getattr(msg, "id", "") or ""
+            if mid not in json_guard:
+                json_guard[mid] = content.lstrip().startswith(("{", "```json"))
+            if json_guard[mid]:
+                continue
+            for piece in narration.feed(mid, content):
+                emitted += len(piece)
+                await queue.put({"type": "token", "content": piece})
+    except Exception as e:
+        logger.warning(f"[router] 直连 {code} 流式失败: {type(e).__name__}: {e}")
+
+    for piece in narration.flush():
+        emitted += len(piece)
+        await queue.put({"type": "token", "content": piece})
+
+    if emitted == 0:
+        # 整条流都被过滤（例如模型只吐了工具调用 JSON 就结束）——给一句可读的降级话术，
+        # 不要再补跑一次非流式：那会重复执行工具，用药记录之类有副作用的工具会写两遍。
+        await queue.put({"type": "token", "content": "服务暂时繁忙，请稍后重试。"})
 
 
 async def _run_cleanup(make_coro) -> None:
@@ -988,6 +1228,8 @@ async def _event_generator(req: ChatRequest, identity: ChatIdentity, request: Re
             turn_id=turn_id,
             entrypoint="/api/v1/chat/stream",
             agent_name="supervisor",
+            input_text=req.message,
+            metadata=_trace_metadata(),
         )
         trace.input_chars = len(req.message)
         # API 请求节点：覆盖整轮 SSE 的生命周期，与内部 supervisor/safety 节点形成父子关系
@@ -1046,6 +1288,34 @@ async def _event_generator(req: ChatRequest, identity: ChatIdentity, request: Re
         if input_verdict.is_blocking:
             outcome, error_type = "blocked", "safety_input_block"
             reply = input_verdict.reply or "该情况存在紧急医疗风险，请立即线下就医或拨打 120。"
+            # critical 输入（自杀意念等）只回话术不够，必须留一条人工兜底的工单；
+            # 建单失败不能挡住急救指引，只记日志。
+            handoff_view = None
+            if input_verdict.level == "critical" and identity.persist and identity.patient_id:
+                try:
+                    from src.infra.database import AsyncSessionLocal
+                    from src.modules.handoff import service as handoff_service
+
+                    async with AsyncSessionLocal() as _db:
+                        _ticket, _created = await handoff_service.create_ticket(
+                            _db,
+                            patient_id=int(identity.patient_id),
+                            session_id=req.session_id,
+                            reason="emergency",
+                            priority="urgent",
+                            summary=req.message[:200],
+                            tenant_id=identity.tenant_id,
+                        )
+                        handoff_view = handoff_service.serialize(_ticket)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        f"高危拦截建单失败 session={req.session_id}: {type(e).__name__}: {e}"
+                    )
+            if handoff_view:
+                reply += (
+                    f"\n\n已同时为你转接人工坐席（工单 {handoff_view.get('ticket_no')}）。"
+                    "请先按上面的指引处理，不要等坐席回复再行动。"
+                )
             await _persist_message(
                 redis, identity, req.session_id, role="user",
                 content=req.message, turn_id=turn_id,
@@ -1062,6 +1332,8 @@ async def _event_generator(req: ChatRequest, identity: ChatIdentity, request: Re
                 },
                 seq=seqs.take(),
             )
+            if handoff_view:
+                yield sse_frame({"type": "handoff", "data": handoff_view}, seq=seqs.take())
             trace.output_chars = len(reply)
             trace.add_span_snapshot("safety.block", "safety", 0,
                                     action=input_verdict.action, rules=input_verdict.rule_ids)
@@ -1185,11 +1457,25 @@ async def _event_generator(req: ChatRequest, identity: ChatIdentity, request: Re
                             tenant_id=identity.tenant_id,
                         )
                 else:
-                    async with trace_span("supervisor_agent", "agent", agent_name="supervisor"):
-                        await _stream_supervisor_turn_events(
-                            llm_message, thread_id, handler, identity,
-                            user_id, req.session_id, queue,
-                        )
+                    from src.agents.direct_worker import SUPPORTED_AGENTS
+                    from src.agents.router import route_message
+
+                    decision = await route_message(llm_message)
+                    if decision.mode == "single" and decision.agent in SUPPORTED_AGENTS:
+                        async with trace_span(
+                            f"{decision.agent}_agent", "agent", agent_name=decision.agent,
+                            attributes={"route": "direct_stream"},
+                        ):
+                            await _stream_direct_turn_events(
+                                decision.agent, llm_message, thread_id, handler,
+                                identity, user_id, req.session_id, queue,
+                            )
+                    else:
+                        async with trace_span("supervisor_agent", "agent", agent_name="supervisor"):
+                            await _stream_supervisor_turn_events(
+                                llm_message, thread_id, handler, identity,
+                                user_id, req.session_id, queue,
+                            )
                 await queue.put(None)  # 正常结束哨兵
             except Exception as e:
                 await queue.put(_friendly_error(e))
@@ -1257,14 +1543,35 @@ async def _event_generator(req: ChatRequest, identity: ChatIdentity, request: Re
         handoff_view = await _session_ticket(user_id, req.session_id)
         if (handoff_view and identity.persist
                 and int(handoff_view.get("id") or 0) > ticket_id_before):
-            if not "".join(full_reply_parts).strip():
-                note = (
-                    f"已为你转接人工坐席（工单 {handoff_view.get('ticket_no')}）。"
-                    "坐席接入前你可以继续补充情况，我会一并交给坐席；"
-                    "坐席回复后会直接显示在这个会话里。"
+            # 高危场景（自杀意念、急症）被 handoff 打断时，模型往往只吐出开头一句共情话，
+            # 此时如果只补"已转人工"，用户拿不到任何求助渠道 —— 先把渠道说清楚。
+            spoken = "".join(full_reply_parts).strip()
+            channel = ""
+            if input_verdict.level in ("high", "critical"):
+                channel = (
+                    "如果你现在有伤害自己的念头或紧急症状，请立即拨打 120 或前往最近的急诊；"
+                    "也可以拨打心理援助热线，寻求专业帮助。\n\n"
                 )
-                full_reply_parts.append(note)
-                yield sse_frame({"type": "token", "content": note}, seq=seqs.take())
+            elif len(spoken) < 80:
+                # 正文只有半句就被中断：急症闸门可能漏判，先给一条通用急救渠道，
+                # 不能让用户只看到"已转人工"却不知道现在该做什么
+                channel = (
+                    "如果症状突然加重（胸痛、呼吸困难、一侧肢体无力、说话不清、意识不清），"
+                    "请立即拨打 120 或前往最近的急诊。\n\n"
+                )
+            note = (
+                f"已为你转接人工坐席（工单 {handoff_view.get('ticket_no')}）。"
+                "坐席接入前你可以继续补充情况，我会一并交给坐席；"
+                "坐席回复后会直接显示在这个会话里。"
+            )
+            if not spoken:
+                full_reply_parts.append(channel + note)
+                yield sse_frame({"type": "token", "content": channel + note}, seq=seqs.take())
+            elif len(spoken) < 80:
+                # 正文只有半句就被打断：保留已发内容，另起一段把渠道和转人工说清楚
+                tail = "\n\n" + channel + note
+                full_reply_parts.append(tail)
+                yield sse_frame({"type": "token", "content": tail}, seq=seqs.take())
             yield sse_frame({"type": "handoff", "data": handoff_view}, seq=seqs.take())
             trace.add_span_snapshot(
                 "handoff", "handoff", 0,
@@ -1308,13 +1615,14 @@ async def _event_generator(req: ChatRequest, identity: ChatIdentity, request: Re
                 logger.warning(f"Token 预算超限 user={user_id} turn={turn_id}: {budget.tokens}")
 
         trace.output_chars = len(final_reply)
+        trace.output_text = final_reply
         trace.add_span_snapshot(
             "final_response", "final_response", 0,
             output_chars=len(final_reply), safety_action=output_verdict.action,
         )
 
         # ── 引用来源：把本轮命中的知识片段下发给前端，并落库留痕 ──────────
-        # 数据源是 TraceRecorder.add_retrieval 收集的检索元信息（doc_rag / graph_rag
+        # 数据源是 turn.add_retrieval 收集的检索元信息（doc_rag / graph_rag
         # 都在命中时写入），因此这里不需要另开一条采集通道，避免两套引用数据互相打架。
         cites = [
             c for c in (trace.retrieval_sources or [])
@@ -1402,7 +1710,10 @@ async def _event_generator(req: ChatRequest, identity: ChatIdentity, request: Re
                     status="ok" if outcome in ("success", "blocked") else "error",
                     error_type=error_type,
                 )
-            end_trace(trace, trace_token, status=outcome, error_type=error_type)
+            end_trace(
+                trace, trace_token, status=outcome, error_type=error_type,
+                output_text=trace.output_text,
+            )
         await _run_cleanup(sse_limiter.exit)
 
 

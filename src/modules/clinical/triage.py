@@ -36,6 +36,10 @@ TRIGGERS = (
     "昏迷", "意识不清", "意识模糊", "晕倒", "昏倒", "抽搐", "休克",
     "大出血", "出血不止", "吐血", "便血", "血便",
     "偏瘫", "半身不遂", "失语", "说不出话", "口角歪",
+    # 卒中口语表达：患者很少说"偏瘫/失语"，多是"说话不清楚、半边身子使不上劲"
+    "说话不清", "说话不利索", "说不清楚话", "吐字不清", "大舌头",
+    "半边身子", "半身麻木", "一侧肢体", "肢体无力", "手脚不听", "手脚不灵",
+    "胳膊抬不起", "腿抬不起", "走路跑偏", "嘴歪", "口角歪斜",
     "剧烈头痛", "头痛欲裂", "喉咙紧", "喉头", "过敏",
     "剧痛", "疼得受不了", "快不行", "濒死",
 )
@@ -44,6 +48,8 @@ TRIGGERS = (
 STRONG_TRIGGERS = (
     "胸痛", "呼吸困难", "喘不上", "窒息", "昏迷", "意识不清", "抽搐",
     "休克", "大出血", "偏瘫", "失语", "快不行", "濒死",
+    # 卒中：4.5 小时溶栓时间窗，分级模型不可用时也必须按 red 提示
+    "说话不清", "半边身子", "一侧肢体", "口角歪斜", "嘴歪", "肢体无力",
 )
 
 
@@ -55,6 +61,20 @@ def hits(text: str) -> bool:
 
 def _has_strong(text: str) -> bool:
     return any(k in text for k in STRONG_TRIGGERS)
+
+
+# 卒中：4.5 小时溶栓窗，"今天内去急诊"不够，必须立即 120。
+# LLM 分级对"说话不清楚+半边身子使不上劲"给过 orange，这里做确定性升级：
+# 一个高特异词（偏瘫/嘴歪/半边身子…）+ 一个支持词，或两个高特异词，即判 red。
+_STROKE_SPECIFIC = ("偏瘫", "半身不遂", "失语", "口角歪斜", "嘴歪", "半边身子", "一侧肢体")
+_STROKE_SUPPORT = ("说话不清", "说不清楚话", "吐字不清", "肢体无力", "手脚不听",
+                   "走路跑偏", "胳膊抬不起", "腿抬不起", "嘴歪")
+
+
+def _stroke_red(text: str) -> bool:
+    specific = sum(1 for k in _STROKE_SPECIFIC if k in text)
+    support = sum(1 for k in _STROKE_SUPPORT if k in text)
+    return (specific >= 1 and support >= 1) or specific >= 2
 
 
 def emergency_reply(level: str, reason: str = "") -> str:
@@ -149,6 +169,11 @@ async def gate(
     if level == LEVEL_GREEN:
         logger.info(f"入口急症闸门：命中关键词但分级为 green（session={session_id}）")
         return None
+
+    if level != LEVEL_RED and _stroke_red(text):
+        logger.warning(f"入口急症闸门：卒中表现按危急升级（原判定 {level}，session={session_id}）")
+        level = LEVEL_RED
+        reason = (reason + "；卒中时间窗，按危急处理") if reason else "卒中表现，按危急处理"
 
     logger.warning(
         f"入口急症闸门 ⚠️ level={level} session={session_id} reason={reason}"

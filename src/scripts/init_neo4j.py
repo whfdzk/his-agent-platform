@@ -23,7 +23,22 @@ from src.core.config import get_settings
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-MEDICAL_JSON_PATH = Path(__file__).resolve().parent.parent / "data" / "raw" / "medical.json"
+# 数据文件在本仓库里落在 src/scripts/medical.json；
+# 老部署（tiangong-agent）里是 src/data/raw/medical.json。两处都试，先有的先用。
+_CANDIDATE_PATHS = [
+    Path(__file__).resolve().parent.parent / "data" / "raw" / "medical.json",
+    Path(__file__).resolve().parent / "medical.json",
+]
+MEDICAL_JSON_PATH = next((p for p in _CANDIDATE_PATHS if p.exists()), _CANDIDATE_PATHS[0])
+
+
+def _lst(value) -> list:
+    """medical.json 里这些字段有 None、有 list，没有字符串。
+
+    原脚本直接 `record.get(k, []) + ...` 或 `for x in record.get(k, [])`，
+    None 会直接抛 TypeError（8808 行里 common_drug 有 1163 行为 None）。
+    """
+    return value if isinstance(value, list) else []
 
 def load_medical_data(filepath: Path) -> list[dict]:
     """加载 medical.json（JSONL 格式，每行一个 JSON 对象）"""
@@ -108,24 +123,24 @@ def init_graph():
 
         entities["Disease"].add(name)
 
-        for s in record.get("symptom", []):
+        for s in _lst(record.get("symptom")):
             if s.strip():
                 entities["Symptom"].add(s.strip())
 
-        for d in record.get("common_drug", []) + record.get("recommand_drug", []):
+        for d in _lst(record.get("common_drug")) + _lst(record.get("recommand_drug")):
             if d.strip():
                 entities["Drug"].add(d.strip())
 
-        for dep in record.get("cure_department", record.get("department", [])):
+        for dep in _lst(record.get("cure_department")) or _lst(record.get("department")):
             if dep.strip():
                 entities["Department"].add(dep.strip())
 
-        for c in record.get("check", []):
+        for c in _lst(record.get("check")):
             if c.strip():
                 entities["Check"].add(c.strip())
 
         # DO_EAT 宜吃 + NO_EAT 忌吃，都是 Food 节点
-        for f in record.get("recommand_eat", []) + record.get("not_eat", []):
+        for f in _lst(record.get("recommand_eat")) + _lst(record.get("not_eat")):
             if f.strip():
                 entities["Food"].add(f.strip())
 
@@ -170,35 +185,35 @@ def init_graph():
         if not name:
             continue
 
-        for s in record.get("symptom", []):
+        for s in _lst(record.get("symptom")):
             if s.strip():
                 relation_pairs["HAS_SYMPTOM"].append((name, s.strip()))
 
-        for dep in record.get("cure_department", record.get("department", [])):
+        for dep in _lst(record.get("cure_department")) or _lst(record.get("department")):
             if dep.strip():
                 relation_pairs["BELONGS_TO"].append((name, dep.strip()))
 
-        for d in record.get("common_drug", []):
+        for d in _lst(record.get("common_drug")):
             if d.strip():
                 relation_pairs["COMMON_DRUG"].append((name, d.strip()))
 
-        for d in record.get("recommand_drug", []):
+        for d in _lst(record.get("recommand_drug")):
             if d.strip():
                 relation_pairs["RECOMMEND_DRUG"].append((name, d.strip()))
 
-        for c in record.get("check", []):
+        for c in _lst(record.get("check")):
             if c.strip():
                 relation_pairs["NEED_CHECK"].append((name, c.strip()))
 
-        for f in record.get("recommand_eat", []):
+        for f in _lst(record.get("recommand_eat")):
             if f.strip():
                 relation_pairs["DO_EAT"].append((name, f.strip()))
 
-        for f in record.get("not_eat", []):
+        for f in _lst(record.get("not_eat")):
             if f.strip():
                 relation_pairs["NO_EAT"].append((name, f.strip()))
 
-        for comp in record.get("acompany", []):
+        for comp in _lst(record.get("acompany")):
             if comp.strip():
                 relation_pairs["ACOMPANY_WITH"].append((name, comp.strip()))
 
@@ -253,7 +268,7 @@ def init_graph():
                 "description":      record.get("desc", "") or "",
                 "cause":            record.get("cause", "") or "",
                 "prevent":          record.get("prevent", "") or "",
-                "cure_way":         "，".join(record.get("cure_way", [])),
+                "cure_way":         "，".join(_lst(record.get("cure_way"))),
                 "cured_prob":       record.get("cured_prob", "") or "",
                 "cure_lasttime":    record.get("cure_lasttime", "") or "",
                 "easy_get":         record.get("easy_get", "") or "",

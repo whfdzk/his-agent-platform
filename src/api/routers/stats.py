@@ -24,7 +24,6 @@ from src.modules.ops.model import TokenUsage
 # 统计/轨迹都是平台运营数据，只开放给管理端（管理员 token）
 router = APIRouter(tags=["stats"], dependencies=[Depends(get_current_admin)])
 
-TRACE_SCAN_LIMIT = 2000     # 轨迹查询最多扫描的 token_usage 行数
 SYMPTOM_SCAN_LIMIT = 2000   # 症状 TopN 最多扫描的主诉条数
 
 
@@ -113,63 +112,6 @@ async def token_stats(
             "avg_latency_ms": int((r.latency_ms or 0) / calls) if calls else 0,
         })
     return {"groups": items, "total": len(items)}
-
-
-@router.get("/api/v1/traces")
-async def list_traces(
-    session_id: str | None = None,
-    user_id: str | None = None,
-    worker: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
-    admin: AdminIdentity = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Agent 轨迹：按 turn_id 聚合 token_usage，输出每轮对话的调用时间线。
-    轨迹 = 一次用户消息触发的多次 LLM 调用（supervisor → worker → ...）。
-    """
-    q = (
-        select(TokenUsage)
-        .where(TokenUsage.tenant_id == admin.tenant_id)
-        .order_by(TokenUsage.created_at.desc(), TokenUsage.id.desc())
-        .limit(TRACE_SCAN_LIMIT)
-    )
-    if session_id:
-        q = q.where(TokenUsage.session_id == session_id)
-    if user_id:
-        q = q.where(TokenUsage.user_id == user_id)
-    if worker:
-        q = q.where(TokenUsage.worker == worker)
-
-    rows = (await db.execute(q)).scalars().all()
-
-    traces: dict[str, dict] = {}
-    order: list[str] = []
-    for r in rows:
-        tid = r.turn_id or f"noturn-{r.id}"
-        if tid not in traces:
-            traces[tid] = {
-                "turn_id": tid,
-                "session_id": r.session_id,
-                "user_id": r.user_id,
-                "created_at": str(r.created_at) if r.created_at else None,
-                "items": [],
-                "total_tokens": 0,
-            }
-            order.append(tid)
-        traces[tid]["items"].append({
-            "worker": r.worker,
-            "model": r.model,
-            "prompt_tokens": r.prompt_tokens,
-            "completion_tokens": r.completion_tokens,
-            "total_tokens": r.total_tokens,
-            "latency_ms": r.latency_ms,
-        })
-        traces[tid]["total_tokens"] += r.total_tokens or 0
-
-    all_traces = [traces[tid] for tid in order]
-    return {"traces": all_traces[offset:offset + limit], "total": len(all_traces)}
 
 
 async def _consultation_breakdowns(since: datetime, tenant_id: int) -> tuple[list, list, list]:

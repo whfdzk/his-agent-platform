@@ -15,6 +15,10 @@ from typing import Any
 
 from loguru import logger
 
+from src.core.safety.repeat import DEFAULT_WINDOW as MAX_REPEAT_WINDOW
+from src.core.safety.repeat import find_repeats
+from src.core.safety.rules import DangerRule, rules_for
+
 # 规则词表：单一事实来源，审核逻辑与管理端规则库展示共用。
 SENSITIVE_WORDS: list[str] = ["赌博", "色情", "暴力"]
 OUT_OF_SCOPE_PATTERNS: list[str] = ["写代码", "做数学题", "翻译文章"]
@@ -80,6 +84,46 @@ class RiskRule:
             "enabled": enabled,
             "patterns": list(self.patterns),
         }
+
+
+# ── 精神心理危险信号接入 ────────────────────────────────────────────────────
+# rules.py 的 DANGER_RULES 原先是"只声明不匹配"的规则库，_judge 从未遍历它，
+# 结果"我觉得活着没意思，不想活了"被判 low/allow，危机干预全靠模型自觉。
+# 急症类规则已由 B3 临床闸门覆盖，这里只接 mental，避免与 triage 双重阻断。
+_LEVEL_MAP = {
+    "info": RiskLevel.LOW,
+    "warn": RiskLevel.MEDIUM,
+    "high": RiskLevel.HIGH,
+    "critical": RiskLevel.CRITICAL,
+}
+
+
+def _mental_rules() -> tuple[tuple[RiskRule, DangerRule], ...]:
+    pairs: list[tuple[RiskRule, DangerRule]] = []
+    for dr in rules_for("input"):
+        if dr.category != "mental":
+            continue
+        # 只接 block 级（自伤/自杀）。mh_depression 是 warn 级且词表含"失眠""焦虑"，
+        # 直接把普通睡眠/情绪咨询标成心理风险会污染正常问诊，暂不接入。
+        if dr.action != "block":
+            continue
+        rule = RiskRule(
+            rule_id=dr.id,
+            rule_name=dr.name,
+            category=dr.category,
+            layer="input",
+            action=SafetyAction.BLOCK if dr.action == "block" else SafetyAction.WARN,
+            risk_level=_LEVEL_MAP.get(dr.level, RiskLevel.HIGH),
+            # patterns 只用于管理端展示；实际匹配走 DangerRule.matches（含 context/evaluator）
+            patterns=list(dr.keywords),
+            advice=dr.advice,
+            reply=dr.advice,
+        )
+        pairs.append((rule, dr))
+    return tuple(pairs)
+
+
+_MENTAL_RULES = _mental_rules()
 
 
 @dataclass
@@ -214,6 +258,12 @@ class SafetyEngine:
             if term is not None:
                 hits.append((rule, term))
 
+        if layer == "input":
+            for rule, dr in _MENTAL_RULES:
+                if dr.matches(text):
+                    term = next((kw for kw in dr.keywords if kw in text), dr.id)
+                    hits.append((rule, term))
+
         if not hits:
             return SafetyVerdict(action=SafetyAction.ALLOW.value, level=RiskLevel.LOW.value)
 
@@ -285,27 +335,28 @@ class SafetyEngine:
         return text
 
     def check_repeat(self, call_history: list[dict], user_id: str = "") -> SafetyResult:
-        """打转检测：同一工具在一轮里被反复调用即中止。"""
+        """打转检测：同一「工具 + 参数」在窗口内被反复提交即中止。
+
+        按指纹判重而非工具名：同名工具换个参数是有效进展，工具名判重会把正常
+        排查（连查三个不同症状）误杀。判定逻辑见 core/safety/repeat.py，
+        真正的拦截面在 supervisor 的 RepeatGuardMiddleware（本方法留作纯判定的复用入口）。
+        """
         if not self._enable_repeat_detection:
             return SafetyResult(action=SafetyAction.ALLOW)
 
-        recent_calls = call_history[-3:] if len(call_history) >= 3 else call_history
-        if len(recent_calls) < 2:
+        repeats = find_repeats(call_history[-MAX_REPEAT_WINDOW:])
+        if not repeats:
             return SafetyResult(action=SafetyAction.ALLOW)
 
-        tool_names = [c.get("tool_name", "") for c in recent_calls]
-        if len(tool_names) != len(set(tool_names)):
-            rule = next(r for r in self._rules if r.rule_id == "repeat_detection")
-            self._block(user_id=user_id, risk_level=rule.risk_level,
-                        reason="检测到重复调用，已中止", layer=rule.rule_id)
-            return SafetyResult(
-                action=SafetyAction.BLOCK,
-                risk_level=rule.risk_level,
-                reason="检测到重复调用，已中止",
-                details={"layer": rule.rule_id},
-            )
-
-        return SafetyResult(action=SafetyAction.ALLOW)
+        rule = next(r for r in self._rules if r.rule_id == "repeat_detection")
+        reason = f"检测到重复调用（同一工具+参数，步数 {len(call_history)}），已中止"
+        self._block(user_id=user_id, risk_level=rule.risk_level, reason=reason, layer=rule.rule_id)
+        return SafetyResult(
+            action=SafetyAction.BLOCK,
+            risk_level=rule.risk_level,
+            reason=reason,
+            details={"layer": rule.rule_id, "repeats": repeats},
+        )
 
     # ── 审计 ────────────────────────────────────────────────────────────
     def _block(self, user_id: str, risk_level: RiskLevel, reason: str, layer: str) -> None:
