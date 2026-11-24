@@ -1,0 +1,79 @@
+name: eval-gate
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "scripts/eval/**"
+      - "src/agents/**"
+      - "src/knowledge/**"
+      - "src/core/safety/**"
+      - ".github/workflows/eval-gate.yml"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # 离线部分：不需要后端/中间件，任何环境都能跑，用来挡住"改坏评测集本身"的提交
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装最小依赖
+        run: pip install httpx==0.28.1 pytest pyyaml
+      - name: 校验评测集 schema 与切分分布
+        run: |
+          python scripts/eval/gen_cases_v2.py
+          python scripts/eval/run_eval.py --cases scripts/eval/cases_v2.json --split core --dry-run
+          python scripts/eval/run_eval.py --cases scripts/eval/cases_v2.json --split holdout --dry-run
+      - name: promptfoo 配置生成自测（dry-run，不登录不调模型，不花 token）
+        run: |
+          python scripts/eval/pf_run.py --split core --only safety --tag ci-dry --dry-run
+          python scripts/eval/pf_run.py --split core --only kb,drug --sample 3 --tag ci-dry --dry-run
+      - name: 评测脚本离线自测（MockTransport，不发真实请求）
+        run: python tools/verify/_verify_eval_offline.py
+
+  # 在线部分：需要 self-hosted runner（起后端 + PostgreSQL/Redis/Milvus/Neo4j）
+  # 没有 EVAL_BASE_URL 时自动跳过，不阻塞主干
+  #
+  # 口径（与本地一致）：safety 整片全量跑并做硬门禁（必须 100%）；
+  # 其余切片只按 --sample 抽样做 smoke，抽样样本不足以判定漂移，因此不接 gate。
+  live-gate:
+    needs: offline
+    if: ${{ vars.EVAL_BASE_URL != '' }}
+    runs-on: [self-hosted, eval]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: safety 全量跑（门禁硬项）
+        env:
+          EVAL_BASE_URL: ${{ vars.EVAL_BASE_URL }}
+          EVAL_TOKEN: ${{ secrets.EVAL_TOKEN }}
+          PROMPTFOO_DISABLE_TELEMETRY: "1"
+        run: |
+          python scripts/eval/pf_run.py --split core --only safety --tag ci-safety \
+            --report doc/eval-reports/ci-safety.json
+      - name: 门禁判定（safety 必须 100%，误杀率不得上升，请求失败必须为 0）
+        run: python scripts/eval/gate.py --current doc/eval-reports/ci-safety.json
+      - name: 常规切片采样 smoke（只观察，不接门禁）
+        env:
+          EVAL_BASE_URL: ${{ vars.EVAL_BASE_URL }}
+          EVAL_TOKEN: ${{ secrets.EVAL_TOKEN }}
+          PROMPTFOO_DISABLE_TELEMETRY: "1"
+        run: |
+          python scripts/eval/pf_run.py --split core --only kb,drug,hospital,adversarial \
+            --sample 6 --tag ci-smoke --report doc/eval-reports/ci-smoke.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-reports
+          path: |
+            doc/eval-reports/ci-*.json
+            scripts/eval/runs/*.jsonl
