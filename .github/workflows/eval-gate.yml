@@ -24,8 +24,10 @@ jobs:
       - name: 安装最小依赖
         run: pip install httpx==0.28.1 pytest pyyaml
       - name: 校验评测集 schema 与切分分布
+        # cases_v2.json 是提交产物，CI 只校验、不重生成：
+        # 生成器 gen_cases_v2.py 依赖 v1 的 scripts/eval/cases.json，该文件未入库，
+        # 在干净 checkout 上重生成必然 FileNotFound，会让本 job 直接红。
         run: |
-          python scripts/eval/gen_cases_v2.py
           python scripts/eval/run_eval.py --cases scripts/eval/cases_v2.json --split core --dry-run
           python scripts/eval/run_eval.py --cases scripts/eval/cases_v2.json --split holdout --dry-run
       - name: promptfoo 配置生成自测（dry-run，不登录不调模型，不花 token）
