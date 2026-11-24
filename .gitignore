@@ -179,3 +179,9 @@ doc/
 .codebuddy/
 .jbeval/
 .workbuddy/
+
+# --- 2026-11-24：评测跑批产物（promptfoo 配置、合并结果、逐条落盘）不入库 ---
+scripts/eval/runs/
+scripts/eval/pf-*.json
+scripts/eval/pf-*.yaml
+scripts/eval/*.json.bak-*
