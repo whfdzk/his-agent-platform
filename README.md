@@ -22,6 +22,18 @@ Vite + React 站点（患者端、管理端），通过 `shared` 包复用类型
                                           └── PostgreSQL · Redis · Milvus · Neo4j · RustFS
 ```
 
+**Harness 分层**（`src/harness/`）——模型之外那套骨架的显式入口：
+
+| 层 | 位置 | 职责 |
+| --- | --- | --- |
+| Harness（控制层） | `src/harness/core.py` + `agents/builder.py` + `agents/supervisor_agent.py` | 装配 Agent、换算预算（max_turns→recursion_limit）、投递领域事件、装配中间件链 |
+| Agent（能力单元） | `src/agents/workers/*`、`src/agents/inquiry/*` | 提 Action、产出结论；不直接决定用多少预算 |
+| Runtime（受控执行） | `src/harness/runtime.py` + `agents/tool_runtime_middleware.py` | Guardrail 前置、单次工具超时、只读工具重试、异常归一成 Observation、计数观测 |
+| Guardrail | `src/core/safety/*`、`src/harness/policy.py` | 输入/输出内容审核 + 工具动作策略（黑名单、参数体量） |
+| State / Trace | `AsyncRedisSaver` checkpointer、长期记忆 store、Langfuse、审计表 | 会话状态、断点恢复、执行轨迹 |
+
+`GET /api/v1/admin/harness/overview` 返回分层归属、预算默认值、运行时计数与策略快照。
+
 #### 后端技术栈
 
 | 分层 | 技术选型 | 说明 |

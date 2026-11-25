@@ -59,6 +59,7 @@ from src.api.routers.admin_tenants import router as admin_tenants_router
 from src.api.routers.admin_agents import router as admin_agents_router
 from src.api.routers.admin_skills import router as admin_skills_router
 from src.api.routers.admin_events import router as admin_events_router
+from src.api.routers.admin_harness import router as admin_harness_router
 from src.api.routers.admin_prompts import router as admin_prompts_router
 from src.api.routers.admin_conversations import router as admin_conversations_router
 from src.api.routers.admin_system import router as admin_system_router
@@ -297,6 +298,8 @@ def create_app() -> FastAPI:
     app.include_router(admin_skills_router)
     # 事件总线观测（Redis Stream 流长 / Pending / 死信 + 已处理明细）
     app.include_router(admin_events_router)
+    # Harness 层自述 + 工具受控执行观测
+    app.include_router(admin_harness_router)
     app.include_router(admin_prompts_router)
     app.include_router(admin_conversations_router)
     app.include_router(admin_system_router)

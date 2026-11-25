@@ -52,10 +52,10 @@ async def resume_handoff(
     try:
         from langgraph.types import Command
 
-        from src.agents.supervisor_agent import get_supervisor_agent
+        from src.harness.core import get_harness
         from src.core.context import UserContext
 
-        agent = await get_supervisor_agent()
+        agent = await get_harness().supervisor()
         config = {"configurable": {"thread_id": thread_id_of(ticket)}}
         state = await agent.aget_state(config)
         if not _pending_handoff_interrupt(state):
@@ -199,3 +199,4 @@ async def persist_closing(ticket: HandoffTicket, text: str) -> None:
             )
     except Exception as e:  # noqa: BLE001
         logger.warning(f"工单 {ticket.ticket_no} 收尾话术落库失败: {type(e).__name__}: {e}")
+

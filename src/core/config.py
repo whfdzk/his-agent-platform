@@ -185,6 +185,11 @@ class Settings(BaseSettings):
     # 单轮执行限额（防跑飞 / 防刷）
     AGENT_MAX_CALLS: int = 12           # 单轮最多 Agent 调用次数
     TOOL_MAX_CALLS: int = 20            # 单轮最多工具调用次数
+    # 受控执行（harness/runtime）：单次工具调用上限与只读工具最大尝试次数。
+    # 只读工具才重试；写工具（建预约/开工单）自动重试等于重复副作用，一律单次。
+    # 超时不重试：已经跑满 60s 的工具重试只会把尾延迟翻倍，不如直接归一成 Observation。
+    TOOL_CALL_TIMEOUT: float = 60.0
+    TOOL_CALL_MAX_ATTEMPTS: int = 2
     TURN_MAX_TOKENS: int = 60000        # 单轮 Token 上限（prompt + completion）
     RETRIEVAL_MAX_RESULTS: int = 8      # 单次检索最多返回条数（预算硬上限）
     USER_MAX_CONCURRENT_TASKS: int = 2  # 同一用户并发任务上限（跨进程，Redis 计数）

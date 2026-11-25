@@ -27,7 +27,12 @@ from loguru import logger
 
 from src.infra.database import AsyncSessionLocal
 from src.infra.redis_cache import get_checkpointer_redis
-from src.agents.supervisor_agent import get_supervisor_agent
+from src.harness.core import get_harness
+
+
+async def get_supervisor_agent():
+    """兼容旧调用点：经 Harness 控制层取主控 Agent（测试里可继续 patch 这个名字）。"""
+    return await get_harness().supervisor()
 from src.core.context import UserContext
 from src.agents.inquiry.graph import run_inquiry
 from src.agents.inquiry.deps import build_inquiry_deps
@@ -1758,3 +1763,5 @@ async def pending_events(
     except Exception:
         logger.exception("pending 事件查询失败")
         raise BizException(BizErrorCode.INTERNAL, "服务内部错误，请稍后重试", status_code=500) from None
+
+

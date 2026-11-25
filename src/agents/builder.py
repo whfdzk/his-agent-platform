@@ -22,6 +22,7 @@ from src.agents.tool_registry import resolve_tools
 from src.agents.repeat_middleware import RepeatGuardMiddleware
 from src.agents.search_budget_middleware import SearchBudgetMiddleware
 from src.agents.skill_middleware import SkillCatalogMiddleware
+from src.agents.tool_runtime_middleware import ToolRuntimeMiddleware
 
 DEFAULT_TEMPERATURE = 0.7
 # 未显式配置 max_turns 时的轮次上限：单次问诊 8 轮模型↔工具往返已足够，
@@ -139,7 +140,13 @@ def build_worker_agent(
         tools=tools,
         system_prompt=system_prompt,
         name=cfg.agent_name,
-        middleware=[RepeatGuardMiddleware(), SearchBudgetMiddleware(), SkillCatalogMiddleware()],
+        middleware=[
+            RepeatGuardMiddleware(),
+            SearchBudgetMiddleware(),
+            SkillCatalogMiddleware(),
+            # 受控执行：策略前置 + 超时 + 只读重试 + 异常归一（harness/runtime 网关）
+            ToolRuntimeMiddleware(),
+        ],
     )
     logger.info(
         f"{cfg.code} agent 已装配：工具 {len(tools)} 个，提示词来源 "
