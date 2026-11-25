@@ -210,6 +210,7 @@ async def _build_supervisor(cfg: AgentRuntimeConfig):
     # 转人工工具常驻：不依赖管理端在工具清单里勾选它。
     # 它是"患者喊人工"的唯一落单入口，漏配等于这个能力直接消失。
     tools = memory_tools + worker_tools
+
     if HANDOFF_TOOL_NAME not in {getattr(t, "name", "") for t in tools}:
         tools = tools + [request_human_handoff]
 

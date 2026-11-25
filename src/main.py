@@ -57,6 +57,8 @@ from src.api.routers.safety import router as safety_router
 from src.api.routers.admin_users import router as admin_users_router
 from src.api.routers.admin_tenants import router as admin_tenants_router
 from src.api.routers.admin_agents import router as admin_agents_router
+from src.api.routers.admin_skills import router as admin_skills_router
+from src.api.routers.admin_events import router as admin_events_router
 from src.api.routers.admin_prompts import router as admin_prompts_router
 from src.api.routers.admin_conversations import router as admin_conversations_router
 from src.api.routers.admin_system import router as admin_system_router
@@ -221,8 +223,15 @@ async def lifespan(app: FastAPI):
     # TTL 轮询：本进程的改动靠管理端主动刷新，其他副本改了库只能靠这里跟上
     await start_agent_config_watcher()
 
+    # 事件总线消费组：与业务进程同生命周期。多实例部署时每个实例各起一个
+    # consumer（同一 group），Redis 会把消息分给其中一个，天然做了负载均衡。
+    from src.modules.events import consumer as event_consumer
+
+    await event_consumer.start()
+
     yield
     # 应用关闭时执行
+    await event_consumer.stop()
     await stop_agent_config_watcher()
     # 关闭数据库连接池
     await stop_consumer()
@@ -285,6 +294,9 @@ def create_app() -> FastAPI:
     app.include_router(admin_users_router)
     app.include_router(admin_tenants_router)
     app.include_router(admin_agents_router)
+    app.include_router(admin_skills_router)
+    # 事件总线观测（Redis Stream 流长 / Pending / 死信 + 已处理明细）
+    app.include_router(admin_events_router)
     app.include_router(admin_prompts_router)
     app.include_router(admin_conversations_router)
     app.include_router(admin_system_router)

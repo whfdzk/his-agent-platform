@@ -482,6 +482,91 @@ export const promptAdminApi = {
     }),
 };
 
+// ── 管理端：技能（SOP）管理 ─────────────────────────────────────────────
+
+export interface SkillItem {
+  id: number;
+  key: string;
+  name: string;
+  description: string;
+  tool_ids: string[];
+  enabled: boolean;
+  active_version: number;
+  mount_hint: string;
+  versions: number;
+  effective: boolean;
+}
+
+export interface SkillVersionItem {
+  version: number;
+  content: string;
+  change_note: string;
+  created_by: string;
+  published_at: string | null;
+  created_at: string | null;
+}
+
+export const skillAdminApi = {
+  list: () =>
+    request<{ items: SkillItem[]; total: number; effective: number }>('/admin/skills'),
+
+  detail: (id: number) =>
+    request<{ skill: SkillItem; versions: SkillVersionItem[] }>(`/admin/skills/${id}`),
+
+  create: (body: {
+    key: string;
+    name: string;
+    description?: string;
+    tool_ids?: string[];
+    mount_hint?: string;
+    content?: string;
+    change_note?: string;
+  }) =>
+    request<{ skill: { id: number; key: string; name: string }; version: number; effective: boolean; hint: string }>(
+      '/admin/skills',
+      { method: 'POST', body },
+    ),
+
+  update: (
+    id: number,
+    body: {
+      name?: string;
+      description?: string;
+      tool_ids?: string[];
+      enabled?: boolean;
+      mount_hint?: string;
+    },
+  ) => request<{ id: number; key: string; enabled: boolean }>(`/admin/skills/${id}`, { method: 'PUT', body }),
+
+  createVersion: (id: number, body: { content: string; change_note?: string }) =>
+    request<{
+      skill_id: number;
+      version: number;
+      active_version: number;
+      effective: boolean;
+      hint: string;
+    }>(`/admin/skills/${id}/versions`, { method: 'POST', body }),
+
+  publish: (id: number, version: number) =>
+    request<{
+      skill_id: number;
+      key: string;
+      active_version: number;
+      published_at: string;
+      effective: boolean;
+      hint: string;
+    }>(`/admin/skills/${id}/publish`, { method: 'POST', body: { version } }),
+
+  rollback: (id: number, version: number) =>
+    request<{
+      skill_id: number;
+      key: string;
+      active_version: number;
+      published_at: string;
+      rolled_back: boolean;
+    }>(`/admin/skills/${id}/rollback`, { method: 'POST', body: { version } }),
+};
+
 // ── 管理端：对话管理 ────────────────────────────────────────────────────
 
 export const conversationAdminApi = {
@@ -601,6 +686,38 @@ export const clinicalActionApi = {
 // 全部传 authResetOn403: false：这里的 403 是业务拒绝（如"该患者不在你的责任范围"），
 // 不该把医生踢下线；真正的凭证失效仍然是 401，由 client 统一处理。
 
+export interface ClinicianPatientDetail {
+  patient: {
+    patient_id: number;
+    name: string;
+    gender: string | null;
+    age: number | null;
+    blood_type: string | null;
+    allergy_history: string | null;
+    medical_history: string | null;
+    phone_masked: string;
+  };
+  visible_reason: string;
+  recent_departments: string[];
+  alerts: {
+    id: number;
+    level: string;
+    level_label: string;
+    reason: string;
+    symptoms: string[];
+    session_id: string | null;
+    created_at: string | null;
+  }[];
+  consultations: {
+    id: number;
+    department: string;
+    chief_complaint: string | null;
+    diagnosis: string | null;
+    urgency_level: string;
+    created_at: string | null;
+  }[];
+}
+
 export const clinicianApi = {
   scope: () =>
     request<ClinicianScopeInfo>('/clinician/scope', { authResetOn403: false }),
@@ -608,6 +725,12 @@ export const clinicianApi = {
   patients: (params: { limit?: number } = {}) =>
     request<ClinicianPatientList>('/clinician/patients', {
       params,
+      authResetOn403: false,
+    }),
+
+  /** 患者档案详情（只读）：档案摘要 + 最近急症 + 最近问诊 */
+  patientDetail: (patientId: number) =>
+    request<ClinicianPatientDetail>(`/clinician/patients/${patientId}`, {
       authResetOn403: false,
     }),
 

@@ -21,7 +21,6 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agents.tool_registry import (
-    skill_catalog,
     tool_catalog,
     validate_sub_agent_codes,
     validate_tool_ids,
@@ -32,6 +31,7 @@ from src.core.agent_registry import RefreshResult, refresh_agents, runtime_statu
 from src.core.exceptions import BizErrorCode, BizException
 from src.infra.database import get_db
 from src.modules.platform.agent_provider import sync_builtin_agents_to_db
+from src.modules.platform import skills as skill_service
 from src.modules.platform.model import (
     AGENT_STATUS_DISABLED,
     AGENT_STATUS_DRAFT,
@@ -248,16 +248,31 @@ async def list_agents(
 
 @router.get("/catalog")
 async def get_agent_catalog(db: AsyncSession = Depends(get_db)):
-    """可配置的工具 / 技能 / 可调度子 Agent（工具目录来自运行时注册表）。"""
+    """可配置的工具 / 技能 / 可调度子 Agent（工具目录来自运行时注册表）。
+
+    技能目录改读 skills 表：此前是 tool_registry 里的一份写死常量，
+    管理端新建/改名的技能在这里看不到，两处口径长期不一致。
+    只列已发布且启用的（与运行时 catalog() 同口径），id 沿用前端既有字段名 id。
+    """
     rows = (await db.execute(select(Agent).order_by(Agent.id))).scalars().all()
     workers = [
         {"code": a.code, "name": a.name}
         for a in rows
         if a.agent_type == "worker"
     ]
+    skills = [
+        {
+            "id": s["key"],
+            "name": s["name"],
+            "description": s["description"],
+            "tool_ids": s["tool_ids"],
+            "version": s["version"],
+        }
+        for s in await skill_service.catalog(db)
+    ]
     return {
         "tools": tool_catalog(),
-        "skills": skill_catalog(),
+        "skills": skills,
         "sub_agents": workers or [
             {"code": code, "name": code} for code in WORKER_TOOL_IDS
         ],

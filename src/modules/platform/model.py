@@ -89,6 +89,54 @@ class PromptVersion(BaseModel):
     )
 
 
+class Skill(BaseModel):
+    """技能（SOP）：一条技能对应多版正文。
+
+    渐进加载：目录只下发 name + description（一句话），模型判断相关后再
+    调 load_skill(key) 取正文，避免把几十条 SOP 全塞进上下文。
+    发布/回滚只改 active_version，正文快照永不覆盖。
+    """
+    __tablename__ = "skills"
+
+    key: Mapped[str] = mapped_column(String(64), nullable=False, comment="技能键，如 inquiry")
+    name: Mapped[str] = mapped_column(String(100), nullable=False, comment="展示名称")
+    description: Mapped[str] = mapped_column(
+        String(500), default="", comment="一句话简介（目录层，模型先看这个）"
+    )
+    tool_ids: Mapped[list | None] = mapped_column(
+        JSONB, nullable=True, comment="该技能声明的工具名（仅用于展示与校验，不直接放权）"
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, comment="是否启用")
+    active_version: Mapped[int] = mapped_column(
+        Integer, default=0, comment="当前生效版本号（0=尚未发布，运行时不加载）"
+    )
+    mount_hint: Mapped[str] = mapped_column(
+        String(200), default="", comment="挂载说明（人工备注，如：挂在问诊 Agent）"
+    )
+
+    __table_args__ = (
+        Index("uq_skills_key", "key", unique=True),
+    )
+
+
+class SkillVersion(BaseModel):
+    """技能正文快照：不可变，发布 / 回滚只改 skills.active_version。"""
+    __tablename__ = "skill_versions"
+
+    skill_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="所属技能 ID")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, comment="版本号，从 1 递增")
+    content: Mapped[str] = mapped_column(Text, nullable=False, comment="SKILL.md 正文")
+    change_note: Mapped[str] = mapped_column(String(300), default="", comment="变更说明")
+    created_by: Mapped[str] = mapped_column(String(64), default="", comment="创建人（管理员用户名）")
+    published_at: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, comment="发布时间（ISO 字符串，未发布为空）"
+    )
+
+    __table_args__ = (
+        Index("uq_skill_versions_skill_version", "skill_id", "version", unique=True),
+    )
+
+
 class SystemConfig(BaseModel):
     """系统配置：参数 / 开关 / 字典统一一张表，前端按 type 渲染不同控件。"""
     __tablename__ = "system_configs"

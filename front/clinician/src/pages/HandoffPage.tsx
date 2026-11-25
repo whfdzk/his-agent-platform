@@ -264,6 +264,15 @@ export function HandoffPage() {
   const chain = current ? buildChain(current, hasClose) : [];
 
   // 过滤条切换后立刻拉一次，避免"筛选条件已变、列表还是旧的"
+  // 窄屏是单列（列表在上、详情在下），点了卡片自动滚到详情，
+  // 否则详情和「认领这张单」按钮落在屏幕外，看起来像点了没反应。
+  const detailRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!selected || !detailRef.current) return;
+    if (window.matchMedia('(min-width: 1024px)').matches) return;
+    detailRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, [selected]);
+
   const firstRun = useRef(true);
   useEffect(() => {
     if (firstRun.current) {
@@ -397,7 +406,7 @@ export function HandoffPage() {
         </Card>
       ) : (
         <div className="grid gap-3 lg:grid-cols-[300px,1fr]">
-          <div className="flex max-h-[70vh] flex-col gap-2 overflow-y-auto pr-1">
+          <div className="flex max-h-[40vh] flex-col gap-2 overflow-y-auto pr-1 lg:max-h-[70vh]">
             {items.map((t) => {
               const meta = STATUS_META[t.status];
               const prio = PRIORITY_META[t.priority] || PRIORITY_META.normal;
@@ -436,6 +445,7 @@ export function HandoffPage() {
           </div>
 
           {current && (
+            <div ref={detailRef} className="scroll-mt-4">
             <Card className="flex min-h-[60vh] flex-col p-4">
               <div className="flex flex-wrap items-start justify-between gap-2">
                 <div>
@@ -561,6 +571,7 @@ export function HandoffPage() {
                 </div>
               )}
             </Card>
+            </div>
           )}
         </div>
       )}

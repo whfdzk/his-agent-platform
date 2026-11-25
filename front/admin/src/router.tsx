@@ -10,6 +10,7 @@ import { SafetyPage } from './pages/SafetyPage';
 import { UsersPage } from './pages/UsersPage';
 import { AgentsPage } from './pages/AgentsPage';
 import { PromptsPage } from './pages/PromptsPage';
+import { SkillsPage } from './pages/SkillsPage';
 import { ConversationsPage } from './pages/ConversationsPage';
 import { SystemConfigPage } from './pages/SystemConfigPage';
 import { MembersPage } from './pages/MembersPage';
@@ -34,6 +35,8 @@ export const router = createBrowserRouter([
           { path: 'handoff', element: <HandoffTicketsPage /> },
           { path: 'agents', element: <AgentsPage /> },
           { path: 'prompts', element: <PromptsPage /> },
+          // 技能（SOP）热更新：目录 → 正文渐进加载，发布即生效
+          { path: 'skills', element: <SkillsPage /> },
           { path: 'models', element: <ModelConfigsPage /> },
           { path: 'knowledge', element: <KnowledgePage /> },
           { path: 'conversations', element: <ConversationsPage /> },

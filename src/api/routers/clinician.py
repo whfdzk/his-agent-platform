@@ -36,11 +36,13 @@ from src.modules.clinical.model import (
 )
 from src.modules.clinician.model import ClinicianDepartment, ClinicianPatient
 from src.modules.clinician.scope import (
+    REASON_DEPARTMENT,
+    REASON_RESPONSIBLE,
     build_scope,
     can_read_event,
     recent_patient_departments,
 )
-from src.modules.medical.model import Patient
+from src.modules.medical.model import Consultation, Department, Patient
 
 router = APIRouter(
     prefix="/api/v1/clinician",
@@ -181,6 +183,113 @@ async def list_patients(
             "visible_reason": "responsible",
         })
     return {"items": items, "total": len(items)}
+
+
+@router.get("/patients/{patient_id}")
+async def get_patient_detail(
+    patient_id: int,
+    ctx: AuthContext = Depends(require_auth()),
+    db: AsyncSession = Depends(get_db),
+):
+    """患者档案详情（只读）：档案摘要 + 最近急症 + 最近问诊。
+
+    可见性沿用 scope.py 的同一口径：责任患者全量可见；非责任患者仅当
+    "最近就诊科室 ∈ 我的绑定科室" 时可看。手机号脱敏、身份证不下发。
+    """
+    clinician_id = _clinician_id(ctx)
+    scope = await build_scope(db, clinician_id)
+    if not scope.department_names and not scope.patient_ids:
+        await _empty_scope(ctx)
+
+    depts = await recent_patient_departments(db, [patient_id])
+    if scope.responsible(patient_id):
+        visible_reason = REASON_RESPONSIBLE
+    elif scope.department_names & depts.get(patient_id, set()):
+        visible_reason = REASON_DEPARTMENT
+    else:
+        raise _forbidden("无权查看该患者档案")
+
+    patient = (
+        await db.execute(select(Patient).where(Patient.id == patient_id))
+    ).scalars().first()
+    if patient is None:
+        raise BizException(BizErrorCode.NOT_FOUND, "患者不存在", status_code=404)
+
+    # 事件再按单条级别过一遍：科室可见者只应看到高危事件，与看板口径一致
+    events = await clinical_events.list_events(db, patient_id=patient_id, limit=40)
+    visible_events = []
+    for e in events:
+        ok, _ = can_read_event(
+            scope,
+            patient_id=patient_id,
+            level=e.get("level") or "",
+            patient_departments=depts.get(patient_id, set()),
+        )
+        if ok:
+            visible_events.append(e)
+        if len(visible_events) >= 10:
+            break
+
+    consults = (
+        await db.execute(
+            select(Consultation)
+            .where(Consultation.patient_id == patient_id)
+            .order_by(Consultation.id.desc())
+            .limit(10)
+        )
+    ).scalars().all()
+    dept_names: dict[int, str] = {}
+    dept_ids = [c.department_id for c in consults if c.department_id]
+    if dept_ids:
+        rows = (
+            await db.execute(select(Department).where(Department.id.in_(dept_ids)))
+        ).scalars().all()
+        dept_names = {d.id: d.name for d in rows}
+
+    phone = patient.phone or ""
+    if len(phone) >= 11:
+        phone_masked = f"{phone[:3]}****{phone[-4:]}"
+    else:
+        phone_masked = "****" if phone else ""
+
+    return {
+        "patient": {
+            "patient_id": patient.id,
+            "name": patient.name,
+            "gender": patient.gender,
+            "age": patient.age,
+            "blood_type": patient.blood_type,
+            "allergy_history": patient.allergy_history,
+            "medical_history": patient.medical_history,
+            # 手机号是个人信息：详情只给脱敏，完整值需走管理端审计口径
+            "phone_masked": phone_masked,
+        },
+        "visible_reason": visible_reason,
+        "recent_departments": sorted(depts.get(patient_id, set())),
+        "alerts": [
+            {
+                "id": e.get("id"),
+                "level": e.get("level"),
+                "level_label": e.get("level_label"),
+                "reason": e.get("reason"),
+                "symptoms": e.get("symptoms") or [],
+                "session_id": e.get("session_id"),
+                "created_at": e.get("created_at"),
+            }
+            for e in visible_events
+        ],
+        "consultations": [
+            {
+                "id": c.id,
+                "department": dept_names.get(c.department_id, ""),
+                "chief_complaint": c.chief_complaint,
+                "diagnosis": c.diagnosis,
+                "urgency_level": c.urgency_level,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+            }
+            for c in consults
+        ],
+    }
 
 
 @router.get("/emergency-events")

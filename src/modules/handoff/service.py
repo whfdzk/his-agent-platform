@@ -23,6 +23,8 @@ from sqlalchemy import desc, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from src.infra.event_bus import publish
+
 from src.modules.handoff.model import (
     ACTIVE_STATUSES,
     PRIORITIES,
@@ -213,6 +215,21 @@ async def create_ticket(
     logger.info(f"人工接管建单：{row.ticket_no} patient={patient_id} reason={reason}")
     if commit:  # 走到这里一定是新单；复用原单在上面已 return，不重复通知
         await broadcast_ticket(row)
+        # 事件驱动：建单事实投到总线，下游（通知 / 统计 / SLA 计时）各自消费，
+        # 不再把"建单之后要做的所有事"塞进这个函数里。dedupe_key 用单号，
+        # 重跑节点或客户端重试都不会投出两条一样的工单事件。
+        await publish(
+            "handoff.ticket.created",
+            {
+                "ticket_no": row.ticket_no,
+                "patient_id": row.patient_id,
+                "session_id": row.session_id,
+                "reason": row.reason,
+                "priority": row.priority,
+            },
+            dedupe_key=str(row.ticket_no),
+            tenant_id=int(tenant_id),
+        )
     return row, True
 
 
@@ -413,6 +430,18 @@ async def reply_ticket(
             "message_count": int(row.message_count or 0),
         },
     )
+    # 坐席回复同样发事件：下游可做首响时长统计 / 质检抽样 / 消息镜像
+    await publish(
+        "handoff.ticket.replied",
+        {
+            "ticket_no": row.ticket_no,
+            "patient_id": row.patient_id,
+            "session_id": row.session_id,
+            "message_count": int(row.message_count or 0),
+        },
+        dedupe_key=f"{row.ticket_no}:msg:{int(row.message_count or 0)}",
+        tenant_id=int(row.tenant_id or 1),
+    )
     return row
 
 
@@ -438,6 +467,18 @@ async def resolve_ticket(
     await db.commit()
     await db.refresh(row)
     await broadcast_ticket(row)
+    # 结单事件：SLA 统计（建单→结单时长）、满意度回访任务的触发点
+    await publish(
+        "handoff.ticket.resolved",
+        {
+            "ticket_no": row.ticket_no,
+            "patient_id": row.patient_id,
+            "session_id": row.session_id,
+            "assigned_to": row.assigned_to,
+        },
+        dedupe_key=f"{row.ticket_no}:resolved",
+        tenant_id=int(row.tenant_id or 1),
+    )
     return row
 
 
@@ -473,3 +514,4 @@ async def ticket_stats(db: AsyncSession, *, tenant_id: int | None = None) -> dic
         "closed": out.get(STATUS_CLOSED, 0),
         "cancelled": out.get(STATUS_CANCELLED, 0),
     }
+

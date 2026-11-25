@@ -21,6 +21,7 @@ from src.core.config import build_llm
 from src.agents.tool_registry import resolve_tools
 from src.agents.repeat_middleware import RepeatGuardMiddleware
 from src.agents.search_budget_middleware import SearchBudgetMiddleware
+from src.agents.skill_middleware import SkillCatalogMiddleware
 
 DEFAULT_TEMPERATURE = 0.7
 # 未显式配置 max_turns 时的轮次上限：单次问诊 8 轮模型↔工具往返已足够，
@@ -115,9 +116,21 @@ def build_worker_agent(
     不参与 cfg 比较，因此不影响提示词来源日志。
     """
     tools = resolve_tools(cfg.tool_ids, fallback=default_tools)
+    # 技能（SOP）渐进加载：worker 是真正干活的执行者，SOP 必须在执行层可查，
+    # 否则管理端发布的正文没法影响实际回答。supervisor 只做路由、不挂技能工具，
+    # 避免它在"先看目录"的指令下反复列举而不去作答（实测会撞 recursion_limit）。
+    from src.tools.skill_tools import list_skills, load_skill
+
+    _names = {getattr(t, "name", "") for t in tools}
+    for _t in (list_skills, load_skill):
+        if _t.name not in _names:
+            tools = tools + [_t]
+
     system_prompt = cfg.system_prompt or default_prompt
     if prompt_suffix:
         system_prompt = f"{system_prompt}\n\n{prompt_suffix}"
+    # 目录由 SkillCatalogMiddleware 每次调模型前注入（含用法约束），
+    # 这里不再往静态提示词里写技能说明：提示词存库，改一次要重新发布，反而不好维护。
     # 打转拦截对 worker 同样必要：容器里没有 supervisor，模型自己就会"换个措辞再查一次"
     # （实测药品 agent 连调 3 次 query_drug_info，每次 15s）。命中同工具同参数时
     # 直接把上次的结论当工具结果回给模型，逼它收敛到作答。
@@ -126,7 +139,7 @@ def build_worker_agent(
         tools=tools,
         system_prompt=system_prompt,
         name=cfg.agent_name,
-        middleware=[RepeatGuardMiddleware(), SearchBudgetMiddleware()],
+        middleware=[RepeatGuardMiddleware(), SearchBudgetMiddleware(), SkillCatalogMiddleware()],
     )
     logger.info(
         f"{cfg.code} agent 已装配：工具 {len(tools)} 个，提示词来源 "

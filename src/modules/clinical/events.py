@@ -109,6 +109,23 @@ async def record_event(
     if commit:
         await db.commit()
         await db.refresh(event)
+        # 急症事件发总线：红/橙事件可被告警订阅者（大屏、值班通知）消费，
+        # 不必让每个写入点自己再去广播一次。
+        from src.infra.event_bus import publish
+
+        await publish(
+            "clinical.event.created",
+            {
+                "event_id": event.id,
+                "event_type": event.event_type,
+                "level": event.level,
+                "patient_id": event.patient_id,
+                "session_id": event.session_id,
+                "reason": event.reason,
+            },
+            dedupe_key=str(event.id),
+            tenant_id=int(tenant_id),
+        )
     return event
 
 
@@ -224,3 +241,4 @@ async def count_by_level(
     for lv, n in (await db.execute(stmt)).all():
         counts[lv] = int(n)
     return counts
+

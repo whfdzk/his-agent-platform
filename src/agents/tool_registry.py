@@ -173,12 +173,19 @@ def _handoff_tools() -> list[Any]:
     return [request_human_handoff]
 
 
+def _skill_tools() -> list[Any]:
+    from src.tools.skill_tools import list_skills, load_skill
+
+    return [list_skills, load_skill]
+
+
 _TOOL_GROUPS = (
     ("患者数据", _patient_tools),
     ("用药", _medication_tools),
     ("健康管理", _health_tools),
     ("就医辅助", _guide_tools),
     ("人工接管", _handoff_tools),
+    ("技能 SOP", _skill_tools),
     ("记忆", _memory_tools),
     ("知识检索", _knowledge_tools),
     ("Agent 调度", _worker_tools),
